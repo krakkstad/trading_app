@@ -10,7 +10,7 @@ import threading
 # ==============================================================================
 # 0. GLOBAL MARKEDSTILSTAND (Felles for alle spillere)
 # ==============================================================================
-# Denne beholderen deler data på tvers av alle aktive Streamlit-sesjoner.
+# Inkluderer nå student-beholdningen!
 
 if 'GLOBAL_STATE_CONTAINER' not in st.session_state:
     st.session_state.GLOBAL_STATE_CONTAINER = {
@@ -27,7 +27,9 @@ if 'GLOBAL_STATE_CONTAINER' not in st.session_state:
         'last_update_time': time.time(),
         'simulation_active': False,
         'order_counter': 0,
-        'trade_counter': 0
+        'trade_counter': 0,
+        # NYTT: Student-objektene lagres her og deles av ALLE sesjoner
+        'students': {} 
     }
 
 GLOBAL_STATE_LOCK = threading.Lock() 
@@ -37,7 +39,7 @@ GLOBAL_STATE_LOCK = threading.Lock()
 # ==============================================================================
 
 class Student:
-    """Enkel klasse for å holde Portefølje- og Kontantdata (Sesjonsspesifikk)."""
+    """Enkel klasse for å holde Portefølje- og Kontantdata."""
     def __init__(self, student_id, role, initial_cash=100000.0):
         self.id = student_id
         self.role = role  
@@ -48,8 +50,8 @@ class Student:
 def initialize_state():
     """Initialiserer Streamlit session state (kun sesjonsspesifikk data)."""
     if 'initialized_session' not in st.session_state:
-        st.session_state.students = {} 
-        st.session_state.active_student = None
+        # st.session_state.students ER FJERNET HERFRA
+        st.session_state.active_student_id = None # Lagrer bare ID-en lokalt
         st.session_state.user_role = None
         st.session_state.initialized_session = True
         st.session_state.status_message = None 
@@ -67,7 +69,7 @@ def update_stock_price():
         last_time = global_state['last_update_time']
         
         time_elapsed = time.time() - last_time
-        delta_t_years = 60.0 / 525600.0 # Tilsvarer 60 sekunder i år
+        delta_t_years = 60.0 / 525600.0 
         
         Z = np.random.standard_normal()
         dS = S * (r * delta_t_years + sigma * np.sqrt(delta_t_years) * Z)
@@ -77,7 +79,6 @@ def update_stock_price():
         global_state['last_update_time'] = time.time()
 
 def black_scholes_price(S, K, t, r, sigma, option_type='call'):
-    """Black-Scholes opsjonsprising."""
     if t <= 0: return max(0, S - K) if option_type == 'call' else max(0, K - S)
     d1 = (np.log(S / K) + (r + 0.5 * sigma**2) * t) / (sigma * np.sqrt(t))
     d2 = d1 - sigma * np.sqrt(t)
@@ -88,7 +89,6 @@ def black_scholes_price(S, K, t, r, sigma, option_type='call'):
     return price
 
 def black_scholes_greeks(S, K, t, r, sigma, option_type='call'):
-    """Beregner Black-Scholes grekere."""
     if t <= 0: return {'delta': 0.0, 'gamma': 0.0, 'theta': 0.0, 'vega': 0.0}
     d1 = (np.log(S / K) + (r + 0.5 * sigma**2) * t) / (sigma * np.sqrt(t))
     N_prime_d1 = norm.pdf(d1)
@@ -139,7 +139,9 @@ def process_market_order(taker_id, side, quantity_remaining):
     """Gjennomfører en Market Order mot Limit Ordrer i den globale boken under lås."""
     with GLOBAL_STATE_LOCK:
         global_state = get_global_state()
-        taker = st.session_state.students[taker_id]
+        
+        # Henter NÅ studenter fra den globale, delte beholderen
+        taker = global_state['students'][taker_id] 
 
         if side == 'BUY': book_key = 'call_asks' 
         else: book_key = 'call_bids' 
@@ -156,8 +158,8 @@ def process_market_order(taker_id, side, quantity_remaining):
                 continue
 
             maker_id = limit_order['id']
-            # Henter makeren fra denne sesjonens st.session_state for å oppdatere porteføljen lokalt
-            maker = st.session_state.students.get(maker_id) 
+            # Henter MAKEREN fra den globale beholderen (kritisk endring)
+            maker = global_state['students'].get(maker_id) 
             if not maker:
                 new_limit_book.append(limit_order)
                 continue 
@@ -200,6 +202,7 @@ def process_market_order(taker_id, side, quantity_remaining):
                 'id': trade_id, 'taker': taker_id, 'maker': maker.id, 'quantity': qty_to_trade, 
                 'price': trade_price, 'time': time.time()
             }
+            # Begge studenters transaksjonslogg oppdateres i den globale beholderen
             taker.transactions.append(transaction_record)
             maker.transactions.append(transaction_record) 
             
@@ -221,6 +224,11 @@ def process_market_order(taker_id, side, quantity_remaining):
 # ==============================================================================
 # 2. UI-KOMPONENTER (Visuell presentasjon)
 # ==============================================================================
+def get_active_student():
+    """Henter den aktive studenten fra den globale beholdningen."""
+    active_id = st.session_state.active_student_id
+    return get_global_state()['students'].get(active_id)
+
 def display_order_book():
     st.subheader("📚 Ordrebok Status (CALL)")
     state = get_global_state()
@@ -260,7 +268,7 @@ def display_market_info():
     display_order_book()
 
 def trading_interface():
-    active_student = st.session_state.active_student
+    active_student = get_active_student()
     
     if active_student.role == 'MAKER':
         st.subheader("✍️ Legg Inn Limit Order (Market Maker)")
@@ -294,7 +302,7 @@ def trading_interface():
                 st.rerun() 
 
 def display_portfolio():
-    student = st.session_state.students[st.session_state.active_student.id]
+    student = get_active_student()
     st.subheader(f"👤 Porteføljeoppsummering for {student.id} (Rolle: {student.role})")
     col_metrics = st.columns(2)
     col_metrics[0].metric("Tilgjengelig Kontantbeholdning", f"${student.cash:.2f}")
@@ -327,24 +335,25 @@ def display_portfolio():
 # ==============================================================================
 
 def main():
-    st.set_page_config(page_title="Opsjonsmarked Simulator V14 (Auto-Login)", layout="wide")
+    st.set_page_config(page_title="Opsjonsmarked Simulator V15 (Full Global Sync)", layout="wide")
     
     initialize_state()
 
     # --- PÅLOGGINGS- OG SYNCH-LOGIKK ---
     
-    if st.session_state.active_student is None:
+    global_students = get_global_state()['students']
+    
+    if st.session_state.active_student_id is None:
         query_params = st.query_params
         user_id_from_url = query_params.get("user_id", [None])[0]
         
         # 1. Prøv å logge inn automatisk via URL-parameter
-        if user_id_from_url in st.session_state.students:
-            st.session_state.active_student = st.session_state.students[user_id_from_url]
-            st.session_state.user_role = st.session_state.active_student.role
-            # Fortsett renderingen (ingen rerun)
+        if user_id_from_url in global_students:
+            st.session_state.active_student_id = user_id_from_url
+            st.session_state.user_role = global_students[user_id_from_url].role
         
         # 2. Vis påloggingsskjema hvis ikke logget inn
-        if st.session_state.active_student is None:
+        if st.session_state.active_student_id is None:
             st.title("Opsjonsmarked Simulator: Logg Inn")
             with st.form("login_form"):
                 student_id = st.text_input("Student ID/Navn", value="StudentA101")
@@ -353,17 +362,17 @@ def main():
                 if submitted:
                     role_type = role.split(' ')[0]
                     
-                    if student_id not in st.session_state.students:
-                        initial_cash = 100000.0 if role_type == 'MAKER' else 50000.0
-                        st.session_state.students[student_id] = Student(student_id, role_type, initial_cash=initial_cash)
+                    with GLOBAL_STATE_LOCK: # Sikker opprettelse/henting
+                        if student_id not in global_students:
+                            initial_cash = 100000.0 if role_type == 'MAKER' else 50000.0
+                            global_students[student_id] = Student(student_id, role_type, initial_cash=initial_cash)
                     
-                    # KRITISK: Setter bruker-ID i URL-en for automatisk gjen-pålogging ved neste rerun
+                    # Sett ID lokalt og i URL
                     st.query_params["user_id"] = student_id
-                    
-                    st.session_state.active_student = st.session_state.students[student_id]
+                    st.session_state.active_student_id = student_id
                     st.session_state.user_role = role_type
-                    st.rerun() # Nødvendig for å oppdatere UI med den nye URL-en og starte simuleringen
-            return # Avslutt main() inntil brukeren er logget inn
+                    st.rerun() 
+            return 
 
     # --- MAIN UI STARTER HER ---
     
@@ -391,11 +400,11 @@ def main():
         if sidebar_container.button("▶️ Start Simulering", type="primary"):
             with GLOBAL_STATE_LOCK:
                 global_state['simulation_active'] = True
-                global_state['last_update_time'] = time.time() # Nullstill tid ved start
+                global_state['last_update_time'] = time.time() 
             st.rerun() 
 
     # --- TIMER OG PRISOPPDATERING (STABIL LOGIKK) ---
-    WAIT_SECONDS = 60 # Oppdateringsintervall
+    WAIT_SECONDS = 60 
     timer_placeholder = sidebar_container.empty()
     
     if sim_active and market_t > 0:
@@ -409,7 +418,7 @@ def main():
         if time_elapsed >= WAIT_SECONDS:
             update_stock_price()
             timer_placeholder.success(f"Automatisk prisoppdatering! Ny pris: ${global_state['market_params']['S']:.2f}")
-            st.rerun() # Tvinger en umiddelbar rerun etter prisendring for rask tilbakemelding
+            st.rerun() 
         
         # 2. Nedtelling
         time_remaining = max(0, WAIT_SECONDS - time_elapsed)
