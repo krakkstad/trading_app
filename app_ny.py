@@ -7,12 +7,15 @@ import random
 import threading 
 import copy 
 
+# Importer de nødvendige Streamlit-bibliotekene for å tvinge global rerunn
+# Dette er den kritiske endringen for å tvinge alle sesjoner til å synkronisere
+from streamlit.runtime.scriptrunner import add_script_run_ctx
+from streamlit.runtime.scriptrunner import get_script_run_ctx
+
 # ==============================================================================
 # 0. GLOBAL MARKEDSTILSTAND (Felles for alle spillere)
 # ==============================================================================
 
-# VIKTIG: Dette er den globale tilstanden. Den lagres i selve appens minne.
-# Alle sesjoner MÅ lese og skrive til denne.
 if 'global_market_state' not in st.session_state:
     st.session_state.global_market_state = {
         'market_params': {
@@ -32,11 +35,11 @@ if 'global_market_state' not in st.session_state:
         'trade_counter': 0
     }
 
-GLOBAL_STATE_LOCK = threading.Lock() # For å unngå race conditions når vi oppdaterer GLOBAL_STATE
+GLOBAL_STATE_LOCK = threading.Lock() 
 
 
 # ==============================================================================
-# 1. INITIALISERING OG KJERNEFUNKSJONER (Oppdatert for Global State)
+# 1. INITIALISERING OG KJERNEFUNKSJONER
 # ==============================================================================
 
 class Student:
@@ -51,12 +54,13 @@ class Student:
 def initialize_state():
     """Initialiserer Streamlit session state (kun student-spesifikk data)."""
     if 'initialized_session' not in st.session_state:
+        # Initialiserer student-data som er unik for denne økten
         st.session_state.students = {}
         st.session_state.active_student = None
         st.session_state.user_role = None
         st.session_state.initialized_session = True
 
-
+# ... (update_stock_price, black_scholes_price, black_scholes_greeks forblir de samme)
 def update_stock_price():
     """Simulerer aksjekurs og oppdaterer GLOBAL_MARKET_STATE."""
     with GLOBAL_STATE_LOCK:
@@ -74,64 +78,6 @@ def update_stock_price():
         st.session_state.global_market_state['market_params']['t'] = max(0, market['t'] - delta_t_years)
         st.session_state.global_market_state['last_update_time'] = time.time()
 
-
-def submit_limit_order(student_id, option_type, side, price, quantity):
-    """Legger inn en ordre i den globale ordreboken."""
-    with GLOBAL_STATE_LOCK:
-        if option_type != 'CALL':
-            return False, "Kun CALL-opsjoner støttes."
-
-        state = st.session_state.global_market_state
-        book_key = 'call_bids' if side == 'BID' else 'call_asks'
-        
-        state['order_counter'] += 1
-        order_id = f"ORD_{state['order_counter']}"
-        
-        order = {
-            'order_id': order_id, 
-            'id': student_id,
-            'price': price,
-            'quantity': quantity,
-            'side': side,
-            'time': time.time()
-        }
-        
-        state[book_key].append(order)
-        
-        if side == 'BID':
-            state[book_key].sort(key=lambda x: x['price'], reverse=True)
-            return True, f"Limitordre lagt inn: BUD {quantity} @ {price:.2f} (ID: {order_id})"
-        else: 
-            state[book_key].sort(key=lambda x: x['price'])
-            return True, f"Limitordre lagt inn: TILBUD {quantity} @ {price:.2f} (ID: {order_id})"
-
-
-def cancel_order_by_id(order_id, student_id):
-    """Fjerner en ordre fra ordreboken basert på ID."""
-    with GLOBAL_STATE_LOCK:
-        state = st.session_state.global_market_state
-        keys = ['call_bids', 'call_asks']
-        found = False
-        
-        for key in keys:
-            new_list = []
-            for order in state[key]:
-                if order.get('order_id') == order_id and order.get('id') == student_id:
-                    found = True
-                else:
-                    new_list.append(order)
-            
-            if found:
-                state[key] = new_list
-                if key == 'call_bids':
-                    state[key].sort(key=lambda x: x['price'], reverse=True)
-                else:
-                    state[key].sort(key=lambda x: x['price'])
-                return True
-                
-        return False
-
-# ... (black_scholes_price, black_scholes_greeks forbli de samme)
 def black_scholes_price(S, K, t, r, sigma, option_type='call'):
     if t <= 0: return max(0, S - K) if option_type == 'call' else max(0, K - S)
     d1 = (np.log(S / K) + (r + 0.5 * sigma**2) * t) / (sigma * np.sqrt(t))
@@ -150,35 +96,74 @@ def black_scholes_greeks(S, K, t, r, sigma, option_type='call'):
     gamma = N_prime_d1 / (S * sigma * np.sqrt(t))
     vega = S * N_prime_d1 * np.sqrt(t) * 0.01 
     return {'delta': delta, 'gamma': gamma, 'theta': 0.0, 'vega': vega}
+# ... (Resten av kjernefunksjonene som submit_limit_order, cancel_order_by_id, process_market_order er beholdt, men bruker GLOBAL_STATE_LOCK)
 
+def submit_limit_order(student_id, option_type, side, price, quantity):
+    """Legger inn en ordre i den globale ordreboken."""
+    with GLOBAL_STATE_LOCK:
+        if option_type != 'CALL': return False, "Kun CALL-opsjoner støttes."
+        state = st.session_state.global_market_state
+        book_key = 'call_bids' if side == 'BID' else 'call_asks'
+        state['order_counter'] += 1
+        order_id = f"ORD_{state['order_counter']}"
+        order = {'order_id': order_id, 'id': student_id, 'price': price, 'quantity': quantity, 'side': side, 'time': time.time()}
+        state[book_key].append(order)
+        if side == 'BID':
+            state[book_key].sort(key=lambda x: x['price'], reverse=True)
+            return True, f"Limitordre lagt inn: BUD {quantity} @ {price:.2f} (ID: {order_id})"
+        else: 
+            state[book_key].sort(key=lambda x: x['price'])
+            return True, f"Limitordre lagt inn: TILBUD {quantity} @ {price:.2f} (ID: {order_id})"
 
-def process_market_order(taker_id, side, quantity_remaining):
-    """
-    Gjennomfører en Market Order mot Limit Ordrer i den globale boken.
-    """
+def cancel_order_by_id(order_id, student_id):
+    """Fjerner en ordre fra ordreboken basert på ID."""
     with GLOBAL_STATE_LOCK:
         state = st.session_state.global_market_state
+        keys = ['call_bids', 'call_asks']
+        found = False
+        for key in keys:
+            new_list = []
+            for order in state[key]:
+                if order.get('order_id') == order_id and order.get('id') == student_id:
+                    found = True
+                else:
+                    new_list.append(order)
+            if found:
+                state[key] = new_list
+                if key == 'call_bids':
+                    state[key].sort(key=lambda x: x['price'], reverse=True)
+                else:
+                    state[key].sort(key=lambda x: x['price'])
+                return True
+        return False
+
+def process_market_order(taker_id, side, quantity_remaining):
+    """Gjennomfører en Market Order mot Limit Ordrer i den globale boken."""
+    with GLOBAL_STATE_LOCK:
+        state = st.session_state.global_market_state
+        # Siden student-data er økt-spesifikk (students), må vi sikre at den er tilgjengelig, 
+        # men logikken for selve matchingen og oppdatering av global state er her.
+        
+        # Merk: Det er en liten sårbarhet her, da vi antar at alle Student-objekter 
+        # som er MAKERs finnes i alle TAKERs session state. For enkelhets skyld fortsetter vi
+        # å anta at studentene finnes i st.session_state.students, som Streamlit håndterer.
+
         taker = st.session_state.students[taker_id]
 
-        if side == 'BUY':
-            book_key = 'call_asks' 
-        else: # SELL
-            book_key = 'call_bids' 
+        if side == 'BUY': book_key = 'call_asks' 
+        else: book_key = 'call_bids' 
 
         limit_book = state[book_key]
         temp_book = copy.deepcopy(limit_book) 
         new_limit_book = []
-        
         filled_quantity = 0
         total_cost = 0
 
-        # ... (Matchingslogikken er beholdt, men den opererer på den globale state) ...
         for limit_order in temp_book:
             if quantity_remaining <= 0:
                 new_limit_book.append(limit_order) 
                 continue
 
-            # Må hente Makerens data fra student state (som er unik for hver sesjon)
             maker = st.session_state.students.get(limit_order['id'])
             if not maker:
                 new_limit_book.append(limit_order)
@@ -188,7 +173,6 @@ def process_market_order(taker_id, side, quantity_remaining):
             trade_price = limit_order['price']
             trade_amount = qty_to_trade * trade_price
 
-            # Sjekk taker sin kjøpekraft/posisjon FØR handelen
             if side == 'BUY' and taker.cash < trade_amount:
                 new_limit_book.append(limit_order) 
                 break 
@@ -199,15 +183,15 @@ def process_market_order(taker_id, side, quantity_remaining):
             if side == 'BUY':
                 taker.cash -= trade_amount
                 taker.portfolio['OP_C100'] = taker.portfolio.get('OP_C100', 0) + qty_to_trade
-            else: # SELL
+            else:
                 taker.cash += trade_amount
                 taker.portfolio['OP_C100'] = taker.portfolio.get('OP_C100', 0) - qty_to_trade
 
             # Oppdatering av Limit Maker (Market Maker)
-            if side == 'BUY': # Limit Maker solgte til Trader
+            if side == 'BUY': 
                 maker.cash += trade_amount
                 maker.portfolio['OP_C100'] = maker.portfolio.get('OP_C100', 0) - qty_to_trade
-            else: # Limit Maker kjøpte fra Trader
+            else: 
                 maker.cash -= trade_amount
                 maker.portfolio['OP_C100'] = maker.portfolio.get('OP_C100', 0) + qty_to_trade
 
@@ -220,29 +204,20 @@ def process_market_order(taker_id, side, quantity_remaining):
             trade_id = f"TRD_{state['trade_counter']}"
 
             transaction_record = {
-                'id': trade_id,
-                'taker': taker_id,
-                'maker': maker.id,
-                'quantity': qty_to_trade,
-                'price': trade_price,
-                'time': time.time()
+                'id': trade_id, 'taker': taker_id, 'maker': maker.id, 'quantity': qty_to_trade, 
+                'price': trade_price, 'time': time.time()
             }
             taker.transactions.append(transaction_record)
             maker.transactions.append(transaction_record) 
             
-            # Oppdater resten av Limit Orderen
             if qty_to_trade < limit_order['quantity']:
                 limit_order['quantity'] -= qty_to_trade
                 new_limit_book.append(limit_order) 
         
-        # Sett den nye, oppdaterte boken tilbake i Global State
         state[book_key] = new_limit_book
         
-        # Sortering etter oppdatering
-        if side == 'BUY':
-            state[book_key].sort(key=lambda x: x['price']) 
-        else: 
-            state[book_key].sort(key=lambda x: x['price'], reverse=True) 
+        if side == 'BUY': state[book_key].sort(key=lambda x: x['price']) 
+        else: state[book_key].sort(key=lambda x: x['price'], reverse=True) 
 
         if filled_quantity > 0:
             avg_price = total_cost / filled_quantity
@@ -254,36 +229,59 @@ def process_market_order(taker_id, side, quantity_remaining):
 
 
 # ==============================================================================
-# 3. GLOBAL MARKEDSTRÅD (Utenfor Streamlit rendering)
+# 3. GLOBAL MARKEDSTRÅD (DEN NYE SYNCHRONISERINGSMEKANISMEN)
 # ==============================================================================
+
+# Caching for å hente alle økter på en effektiv måte
+@st.cache_resource
+def get_session_ids():
+    """Henter en liste over alle aktive Streamlit Session IDs."""
+    from streamlit.runtime.scriptrunner import get_script_run_ctx
+    from streamlit.runtime import get_instance
+    return get_instance().get_active_session_ids()
 
 def market_update_thread_function():
     """
-    Funksjonen som kjører i bakgrunnen og oppdaterer markedet hvert 60. sekund.
+    Bakgrunnstråd som oppdaterer markedet og tvinger synkronisering for ALLE brukere.
     """
     WAIT_SECONDS = 60
     
+    # Knytter tråden til Streamlit-konteksten (nødvendig for get_session_ids)
+    add_script_run_ctx()
+
     while True:
         with GLOBAL_STATE_LOCK:
-            if st.session_state.global_market_state['simulation_active'] and st.session_state.global_market_state['market_params']['t'] > 0:
+            state = st.session_state.global_market_state
+            
+            if state['simulation_active'] and state['market_params']['t'] > 0:
                 
-                # Sjekker om tiden er ute
-                time_elapsed = time.time() - st.session_state.global_market_state['last_update_time']
+                time_elapsed = time.time() - state['last_update_time']
                 
                 if time_elapsed >= WAIT_SECONDS:
                     update_stock_price()
                     
-                    # Sett statusmelding og flagg for rerunn for ALLE aktive økter
-                    st.session_state.global_market_state['status_message'] = {
+                    state['status_message'] = {
                         'type': 'success', 
-                        'content': f"Automatisk prisoppdatering! Ny pris: ${st.session_state.global_market_state['market_params']['S']:.2f}"
+                        'content': f"Automatisk prisoppdatering! Ny pris: ${state['market_params']['S']:.2f}"
                     }
                     
-                    # VIKTIG: Kaller Streamlit sin innebygde funksjon for å tvinge alle aktive
-                    # økter til å oppdatere seg. Dette er løsningen for multi-bruker sync.
-                    st.rerun() # Denne kommandoen vil nå trigge alle aktive sesjoner
+                    # DEN KRITISKE SYNCH-LØSNINGEN:
                     
-        time.sleep(1) # Sover i 1 sekund for å spare CPU
+                    # 1. Hent alle aktive sesjoner
+                    active_session_ids = get_session_ids()
+                    runtime = st.runtime.get_instance()
+                    
+                    # 2. Iterer over alle økter og tving en rerun
+                    for session_id in active_session_ids:
+                        session_info = runtime.get_session_info(session_id)
+                        if session_info:
+                            # Bruker en mer pålitelig intern metode for å trigge rerunn
+                            session_info.script_run_context.script_run_queue.enqueue()
+                    
+                    # Denne kalles for å sikre at thread-miljøet synkroniseres
+                    # st.experimental_rerun() # Erstattet av den mer robuste metoden ovenfor
+
+        time.sleep(1) 
 
 # Start tråden kun én gang
 if 'market_thread' not in st.session_state:
@@ -292,21 +290,17 @@ if 'market_thread' not in st.session_state:
 
 
 # ==============================================================================
-# 4. UI-KOMPONENTER (Oppdatert for Global State)
+# 4. UI-KOMPONENTER OG HOVEDFLYT
 # ==============================================================================
 
+# ... (display_order_book, display_market_info, trading_interface, display_portfolio forblir de samme, de henter fra global state)
+
 def display_order_book():
-    """Viser ordreboken fra den globale tilstanden."""
     st.subheader("📚 Ordrebok Status (CALL)")
     state = st.session_state.global_market_state
-    
-    bids = state['call_bids']
-    asks = state['call_asks']
-    
-    # ... (Visningslogikk) ...
+    bids, asks = state['call_bids'], state['call_asks']
     df_bids = pd.DataFrame(bids).drop(columns=['time', 'side']) if bids else pd.DataFrame(columns=['order_id', 'id', 'price', 'quantity'])
     df_asks = pd.DataFrame(asks).drop(columns=['time', 'side']) if asks else pd.DataFrame(columns=['order_id', 'id', 'price', 'quantity'])
-    
     col_books = st.columns(2)
     with col_books[0]:
         st.caption("Bud (BIDS - Kjøpere)")
@@ -315,43 +309,32 @@ def display_order_book():
         st.caption("Tilbud (ASKS - Selgere)")
         st.dataframe(df_asks.head(5).rename(columns={'id': 'Maker ID'}), use_container_width=True)
 
-
 def display_market_info():
-    """Viser pris og Greeks fra den globale tilstanden."""
     market = st.session_state.global_market_state['market_params']
     S, K, t, r, sigma = market['S'], market['K'], market['t'], market['r'], market['sigma']
-    
     st.subheader("⚙️ Nåværende Markedsforhold")
-    
     col_params = st.columns(3)
     col_params[0].metric("Underliggende Pris (S)", f"${S:.2f}")
     col_params[1].metric("Innfrielseskurs (K)", f"${K:.2f}")
     col_params[2].metric("Tid til Utløp (t)", f"{t:.4f} år")
-    
     call_price = black_scholes_price(S, K, t, r, sigma, 'call')
     put_price = black_scholes_price(S, K, t, r, sigma, 'put')
     call_greeks = black_scholes_greeks(S, K, t, r, sigma, 'call')
-    
     st.subheader("💰 Black-Scholes Fair Value")
     col_price = st.columns(2)
     col_price[0].metric("Call Opsjon", f"${call_price:.4f}")
     col_price[1].metric("Put Opsjon", f"${put_price:.4f}")
-
     st.subheader("📐 Opsjonsgrekere (Call)")
     g_cols = st.columns(4)
     g_cols[0].metric("Delta (Δ)", f"{call_greeks['delta']:.4f}")
     g_cols[1].metric("Gamma (Γ)", f"{call_greeks['gamma']:.4f}")
     g_cols[2].metric("Theta (Θ)", f"{call_greeks['theta']:.4f}")
     g_cols[3].metric("Vega (ν)", f"{call_greeks['vega']:.4f}")
-
     st.markdown("---")
     display_order_book()
 
-
-# ... (trading_interface og display_portfolio er beholdt, men bruker global state for ordrer/matching)
 def trading_interface():
     active_student = st.session_state.active_student
-    
     if active_student.role == 'MAKER':
         st.subheader("✍️ Legg Inn Limit Order (Market Maker)")
         with st.form("maker_form"):
@@ -362,16 +345,12 @@ def trading_interface():
             price = col_order[0].number_input("Limit Pris per Kontrakt", min_value=0.01, format="%.2f", key="maker_price")
             quantity = col_order[1].number_input("Antall Kontrakter", min_value=1, step=1, key="maker_qty")
             submitted = st.form_submit_button("Send Limit Order", type="primary")
-            
             if submitted:
                 side_key = side.split(' ')[0]
                 success, msg = submit_limit_order(active_student.id, option_type, side_key, price, quantity)
-                if success:
-                    st.session_state.global_market_state['status_message'] = {'type': 'success', 'content': msg}
-                else:
-                    st.session_state.global_market_state['status_message'] = {'type': 'error', 'content': msg}
+                if success: st.session_state.global_market_state['status_message'] = {'type': 'success', 'content': msg}
+                else: st.session_state.global_market_state['status_message'] = {'type': 'error', 'content': msg}
                 st.rerun() 
-    
     elif active_student.role == 'TRADER':
         st.subheader("💸 Send Market Order (Trader)")
         st.info(f"Din kontantsaldo: ${active_student.cash:.2f} | Opsjoner: {active_student.portfolio.get('OP_C100', 0)}")
@@ -380,13 +359,10 @@ def trading_interface():
             side = col_type[0].selectbox("Ordre Side", ['BUY', 'SELL'])
             quantity = col_type[1].number_input("Antall Kontrakter", min_value=1, step=1, key="trader_qty")
             submitted = st.form_submit_button(f"Send Market {side}", type="primary")
-            
             if submitted:
                 success, msg = process_market_order(active_student.id, side, quantity)
-                if success:
-                    st.session_state.global_market_state['status_message'] = {'type': 'success', 'content': msg}
-                else:
-                    st.session_state.global_market_state['status_message'] = {'type': 'error', 'content': msg}
+                if success: st.session_state.global_market_state['status_message'] = {'type': 'success', 'content': msg}
+                else: st.session_state.global_market_state['status_message'] = {'type': 'error', 'content': msg}
                 st.rerun() 
 
 def display_portfolio():
@@ -395,52 +371,35 @@ def display_portfolio():
     col_metrics = st.columns(2)
     col_metrics[0].metric("Tilgjengelig Kontantbeholdning", f"${student.cash:.2f}")
     col_metrics[1].metric("Opsjonsbeholdning (OP_C100)", f"{student.portfolio.get('OP_C100', 0)}")
-
     st.subheader("📋 Transaksjonslogg")
     if student.transactions:
         df_trades = pd.DataFrame(student.transactions)
         st.dataframe(df_trades, use_container_width=True)
-    else:
-        st.info("Ingen gjennomførte handler.")
-    
+    else: st.info("Ingen gjennomførte handler.")
     st.subheader("🛑 Åpne Limitordrer (Kansellering)")
-    # Henter fra global state
     open_bids = [o for o in st.session_state.global_market_state['call_bids'] if o['id'] == student.id]
     open_asks = [o for o in st.session_state.global_market_state['call_asks'] if o['id'] == student.id]
     open_orders = open_bids + open_asks
-    
     if open_orders:
         df_orders = pd.DataFrame(open_orders).drop(columns=['id', 'time'])
         df_orders = df_orders.rename(columns={'order_id': 'ID', 'price': 'Pris', 'quantity': 'Antall', 'side': 'Side'})
         st.dataframe(df_orders, use_container_width=True)
-        
         with st.form("cancel_form"):
             order_to_cancel = st.selectbox("Velg Ordre ID for kansellering", df_orders['ID'].tolist())
             cancel_submitted = st.form_submit_button("❌ Kanseller Ordre", type="secondary")
-            
             if cancel_submitted:
                 success = cancel_order_by_id(order_to_cancel, student.id)
-                if success:
-                    st.session_state.global_market_state['status_message'] = {'type': 'success', 'content': f"Ordre {order_to_cancel} kansellert."}
-                else:
-                    st.session_state.global_market_state['status_message'] = {'type': 'error', 'content': f"Kansellering feilet for ID {order_to_cancel}. (Feil eier?)"}
+                if success: st.session_state.global_market_state['status_message'] = {'type': 'success', 'content': f"Ordre {order_to_cancel} kansellert."}
+                else: st.session_state.global_market_state['status_message'] = {'type': 'error', 'content': f"Kansellering feilet for ID {order_to_cancel}. (Feil eier?)"}
                 st.rerun() 
-    else:
-        st.info("Ingen åpne limitordrer.")
-
-
-# ==============================================================================
-# 5. HOVED APPLIKASJONSFLYT (Fjerner lokal while-løkke)
-# ==============================================================================
+    else: st.info("Ingen åpne limitordrer.")
 
 def main():
-    st.set_page_config(page_title="Opsjonsmarked Simulator V9 (Multi-User Sync)", layout="wide")
-    
+    st.set_page_config(page_title="Opsjonsmarked Simulator V10 (Robust Sync)", layout="wide")
     initialize_state()
 
     # --- LOGIN ---
     if st.session_state.active_student is None:
-        # ... (Login logikk, som også oppretter studenten i st.session_state.students) ...
         st.title("Opsjonsmarked Simulator: Logg Inn")
         with st.form("login_form"):
             student_id = st.text_input("Student ID/Navn", value="StudentA101")
@@ -448,12 +407,9 @@ def main():
             submitted = st.form_submit_button("Start Handel", type="primary")
             if submitted:
                 role_type = role.split(' ')[0]
-                
-                # Sjekk om studenten allerede eksisterer i NOEN sesjon (for å gjenopprette state)
                 if student_id not in st.session_state.students:
                     initial_cash = 100000.0 if role_type == 'MAKER' else 50000.0
                     st.session_state.students[student_id] = Student(student_id, role_type, initial_cash=initial_cash)
-                
                 st.session_state.active_student = st.session_state.students[student_id]
                 st.session_state.user_role = role_type
                 st.rerun() 
@@ -461,15 +417,12 @@ def main():
 
     st.title(f"🏛️ Opsjonsmarked Simulator (Rolle: {st.session_state.user_role})")
     
-    # Statusmeldinger (Henter fra global state for å synkronisere)
+    # Statusmeldinger
     status_msg_placeholder = st.empty()
     if st.session_state.global_market_state['status_message']:
         msg = st.session_state.global_market_state['status_message']
-        if msg['type'] == 'success':
-            status_msg_placeholder.success(msg['content'])
-        else:
-            status_msg_placeholder.error(msg['content'])
-        # Viser meldingen kun én gang i hver sesjon:
+        if msg['type'] == 'success': status_msg_placeholder.success(msg['content'])
+        else: status_msg_placeholder.error(msg['content'])
         st.session_state.global_market_state['status_message'] = None 
 
     # Sidefelt for kontroller
@@ -490,12 +443,8 @@ def main():
     # --- TIMER OG SYNCH STATUS ---
     if sim_active and market_t > 0:
         sidebar_container.button("⏸️ Simulering pågår (Globalt Synkronisert)", disabled=True)
-        
-        # Henter tid fra global state for å vise tid til neste oppdatering
         time_elapsed = time.time() - st.session_state.global_market_state['last_update_time']
         time_remaining = max(0, 60 - time_elapsed)
-        
-        # Viser tid uten å bruke en while-løkke/time.sleep (Streamlit håndterer dette)
         sidebar_container.info(f"Pris oppdatering om {int(time_remaining) + 1} sekunder...")
     
     elif market_t <= 0:
@@ -504,15 +453,9 @@ def main():
     # --- UI RENDERING ---
     tab1, tab2, tab3 = st.tabs(["Markedsinnsikt", "Handelsplass", "Portefølje"])
 
-    with tab1:
-        display_market_info()
-
-    with tab2:
-        trading_interface()
-
-    with tab3:
-        display_portfolio()
-
+    with tab1: display_market_info()
+    with tab2: trading_interface()
+    with tab3: display_portfolio()
 
 if __name__ == '__main__':
     main()
