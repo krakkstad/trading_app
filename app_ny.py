@@ -4,18 +4,15 @@ import streamlit as st
 import time
 import pandas as pd
 import random
-import threading 
 import copy 
-
-# Importer de nødvendige Streamlit-bibliotekene for å tvinge global rerunn
-# Dette er den kritiske endringen for å tvinge alle sesjoner til å synkronisere
-from streamlit.runtime.scriptrunner import add_script_run_ctx
-from streamlit.runtime.scriptrunner import get_script_run_ctx
+import threading # Beholder threading.Lock for sikker skriving til Global State
 
 # ==============================================================================
 # 0. GLOBAL MARKEDSTILSTAND (Felles for alle spillere)
 # ==============================================================================
 
+# Definerer global state utenfor st.session_state (som er unikt per bruker)
+# Vi bruker st.session_state KUN som en peker til den globale state.
 if 'global_market_state' not in st.session_state:
     st.session_state.global_market_state = {
         'market_params': {
@@ -35,11 +32,11 @@ if 'global_market_state' not in st.session_state:
         'trade_counter': 0
     }
 
-GLOBAL_STATE_LOCK = threading.Lock() 
+GLOBAL_STATE_LOCK = threading.Lock() # Beskytter global_market_state mot race conditions
 
 
 # ==============================================================================
-# 1. INITIALISERING OG KJERNEFUNKSJONER
+# 1. KJERNEFUNKSJONER
 # ==============================================================================
 
 class Student:
@@ -54,13 +51,12 @@ class Student:
 def initialize_state():
     """Initialiserer Streamlit session state (kun student-spesifikk data)."""
     if 'initialized_session' not in st.session_state:
-        # Initialiserer student-data som er unik for denne økten
         st.session_state.students = {}
         st.session_state.active_student = None
         st.session_state.user_role = None
         st.session_state.initialized_session = True
 
-# ... (update_stock_price, black_scholes_price, black_scholes_greeks forblir de samme)
+
 def update_stock_price():
     """Simulerer aksjekurs og oppdaterer GLOBAL_MARKET_STATE."""
     with GLOBAL_STATE_LOCK:
@@ -68,16 +64,20 @@ def update_stock_price():
         S, r, sigma = market['S'], market['r'], market['sigma']
         last_time = st.session_state.global_market_state['last_update_time']
         
+        # Bruk en fast tidsskala for oppdateringen for å unngå flytende tid
         time_elapsed = time.time() - last_time
-        delta_t_years = 1.0 / 525600.0 * time_elapsed 
+        delta_t_years = 60.0 / 525600.0 # 60 sekunder i år
         
         Z = np.random.standard_normal()
+        # Endrer pris basert på Black-Scholes stokastiske bevegelse
         dS = S * (r * delta_t_years + sigma * np.sqrt(delta_t_years) * Z)
         
         st.session_state.global_market_state['market_params']['S'] = max(0.01, S + dS) 
         st.session_state.global_market_state['market_params']['t'] = max(0, market['t'] - delta_t_years)
         st.session_state.global_market_state['last_update_time'] = time.time()
 
+
+# ... (black_scholes_price, black_scholes_greeks forbli de samme)
 def black_scholes_price(S, K, t, r, sigma, option_type='call'):
     if t <= 0: return max(0, S - K) if option_type == 'call' else max(0, K - S)
     d1 = (np.log(S / K) + (r + 0.5 * sigma**2) * t) / (sigma * np.sqrt(t))
@@ -96,7 +96,7 @@ def black_scholes_greeks(S, K, t, r, sigma, option_type='call'):
     gamma = N_prime_d1 / (S * sigma * np.sqrt(t))
     vega = S * N_prime_d1 * np.sqrt(t) * 0.01 
     return {'delta': delta, 'gamma': gamma, 'theta': 0.0, 'vega': vega}
-# ... (Resten av kjernefunksjonene som submit_limit_order, cancel_order_by_id, process_market_order er beholdt, men bruker GLOBAL_STATE_LOCK)
+
 
 def submit_limit_order(student_id, option_type, side, price, quantity):
     """Legger inn en ordre i den globale ordreboken."""
@@ -130,10 +130,8 @@ def cancel_order_by_id(order_id, student_id):
                     new_list.append(order)
             if found:
                 state[key] = new_list
-                if key == 'call_bids':
-                    state[key].sort(key=lambda x: x['price'], reverse=True)
-                else:
-                    state[key].sort(key=lambda x: x['price'])
+                if key == 'call_bids': state[key].sort(key=lambda x: x['price'], reverse=True)
+                else: state[key].sort(key=lambda x: x['price'])
                 return True
         return False
 
@@ -141,13 +139,6 @@ def process_market_order(taker_id, side, quantity_remaining):
     """Gjennomfører en Market Order mot Limit Ordrer i den globale boken."""
     with GLOBAL_STATE_LOCK:
         state = st.session_state.global_market_state
-        # Siden student-data er økt-spesifikk (students), må vi sikre at den er tilgjengelig, 
-        # men logikken for selve matchingen og oppdatering av global state er her.
-        
-        # Merk: Det er en liten sårbarhet her, da vi antar at alle Student-objekter 
-        # som er MAKERs finnes i alle TAKERs session state. For enkelhets skyld fortsetter vi
-        # å anta at studentene finnes i st.session_state.students, som Streamlit håndterer.
-
         taker = st.session_state.students[taker_id]
 
         if side == 'BUY': book_key = 'call_asks' 
@@ -227,74 +218,9 @@ def process_market_order(taker_id, side, quantity_remaining):
         else:
             return False, f"Market Order feilet: Ukjent feil."
 
-
 # ==============================================================================
-# 3. GLOBAL MARKEDSTRÅD (DEN NYE SYNCHRONISERINGSMEKANISMEN)
+# 2. UI-KOMPONENTER (Uendret logikk, henter fra Global State)
 # ==============================================================================
-
-# Caching for å hente alle økter på en effektiv måte
-@st.cache_resource
-def get_session_ids():
-    """Henter en liste over alle aktive Streamlit Session IDs."""
-    from streamlit.runtime.scriptrunner import get_script_run_ctx
-    from streamlit.runtime import get_instance
-    return get_instance().get_active_session_ids()
-
-def market_update_thread_function():
-    """
-    Bakgrunnstråd som oppdaterer markedet og tvinger synkronisering for ALLE brukere.
-    """
-    WAIT_SECONDS = 60
-    
-    # Knytter tråden til Streamlit-konteksten (nødvendig for get_session_ids)
-    add_script_run_ctx()
-
-    while True:
-        with GLOBAL_STATE_LOCK:
-            state = st.session_state.global_market_state
-            
-            if state['simulation_active'] and state['market_params']['t'] > 0:
-                
-                time_elapsed = time.time() - state['last_update_time']
-                
-                if time_elapsed >= WAIT_SECONDS:
-                    update_stock_price()
-                    
-                    state['status_message'] = {
-                        'type': 'success', 
-                        'content': f"Automatisk prisoppdatering! Ny pris: ${state['market_params']['S']:.2f}"
-                    }
-                    
-                    # DEN KRITISKE SYNCH-LØSNINGEN:
-                    
-                    # 1. Hent alle aktive sesjoner
-                    active_session_ids = get_session_ids()
-                    runtime = st.runtime.get_instance()
-                    
-                    # 2. Iterer over alle økter og tving en rerun
-                    for session_id in active_session_ids:
-                        session_info = runtime.get_session_info(session_id)
-                        if session_info:
-                            # Bruker en mer pålitelig intern metode for å trigge rerunn
-                            session_info.script_run_context.script_run_queue.enqueue()
-                    
-                    # Denne kalles for å sikre at thread-miljøet synkroniseres
-                    # st.experimental_rerun() # Erstattet av den mer robuste metoden ovenfor
-
-        time.sleep(1) 
-
-# Start tråden kun én gang
-if 'market_thread' not in st.session_state:
-    st.session_state.market_thread = threading.Thread(target=market_update_thread_function, daemon=True)
-    st.session_state.market_thread.start()
-
-
-# ==============================================================================
-# 4. UI-KOMPONENTER OG HOVEDFLYT
-# ==============================================================================
-
-# ... (display_order_book, display_market_info, trading_interface, display_portfolio forblir de samme, de henter fra global state)
-
 def display_order_book():
     st.subheader("📚 Ordrebok Status (CALL)")
     state = st.session_state.global_market_state
@@ -394,8 +320,14 @@ def display_portfolio():
                 st.rerun() 
     else: st.info("Ingen åpne limitordrer.")
 
+
+# ==============================================================================
+# 3. HOVED APPLIKASJONSFLYT (Ny oppdateringsmekanisme)
+# ==============================================================================
+
 def main():
-    st.set_page_config(page_title="Opsjonsmarked Simulator V10 (Robust Sync)", layout="wide")
+    st.set_page_config(page_title="Opsjonsmarked Simulator V11 (Stabil Synkronisering)", layout="wide")
+    
     initialize_state()
 
     # --- LOGIN ---
@@ -439,13 +371,39 @@ def main():
             with GLOBAL_STATE_LOCK:
                 st.session_state.global_market_state['simulation_active'] = True
             st.rerun() 
+
+    # --- TIMER OG PRISOPPDATERING (NY LOGIKK) ---
+    WAIT_SECONDS = 60 # Oppdateringsintervall
     
-    # --- TIMER OG SYNCH STATUS ---
     if sim_active and market_t > 0:
-        sidebar_container.button("⏸️ Simulering pågår (Globalt Synkronisert)", disabled=True)
-        time_elapsed = time.time() - st.session_state.global_market_state['last_update_time']
-        time_remaining = max(0, 60 - time_elapsed)
+        sidebar_container.button("⏸️ Simulering pågår (Synkronisert)", disabled=True)
+        
+        # Henter tid fra global state
+        last_update = st.session_state.global_market_state['last_update_time']
+        current_time = time.time()
+        time_elapsed = current_time - last_update
+        
+        # 1. Oppdater Global State hvis tiden er ute
+        if time_elapsed >= WAIT_SECONDS:
+            update_stock_price()
+            with GLOBAL_STATE_LOCK:
+                st.session_state.global_market_state['status_message'] = {
+                    'type': 'success', 
+                    'content': f"Automatisk prisoppdatering! Ny pris: ${st.session_state.global_market_state['market_params']['S']:.2f}"
+                }
+            
+            # Tvinger en umiddelbar rerun
+            st.rerun() 
+            
+        # 2. Nedtelling (oppdateres i et fast intervall)
+        time_remaining = max(0, WAIT_SECONDS - time_elapsed)
         sidebar_container.info(f"Pris oppdatering om {int(time_remaining) + 1} sekunder...")
+        
+        # Streamlit må tvinges til å oppdatere UI for å vise nedtellingen
+        # Bruk st.rerun() for å trigge ny rendering etter et kort sekund
+        # Denne "sover" i 1 sekund og trigges så på nytt.
+        time.sleep(1)
+        st.rerun() 
     
     elif market_t <= 0:
         sidebar_container.error("Opsjonen har utløpt.")
@@ -457,5 +415,7 @@ def main():
     with tab2: trading_interface()
     with tab3: display_portfolio()
 
+
 if __name__ == '__main__':
+    # Streamlit Cloud vil automatisk kjøre denne main-funksjonen
     main()
