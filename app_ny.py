@@ -12,6 +12,26 @@ from pathlib import Path
 # 0. SHARED GLOBAL STATE (CRITICAL FIX!)
 # ==============================================================================
 
+class GlobalState:
+    """Global state container that can be safely cached and modified."""
+    def __init__(self):
+        self.market_params = {
+            'ticker': 'OP_C100', 
+            'S': 105.0, 
+            'K': 100.0, 
+            't': 0.25, 
+            'r': 0.04, 
+            'sigma': 0.30     
+        }
+        self.call_bids = []
+        self.call_asks = []
+        self.last_update_time = time.time()
+        self.simulation_active = False
+        self.order_counter = 0
+        self.trade_counter = 0
+        self.students = {}
+        self.last_file_save = time.time()
+
 @st.cache_resource
 def get_shared_state():
     """
@@ -19,24 +39,7 @@ def get_shared_state():
     that persists across ALL user sessions and browser tabs.
     This is the key to multi-user synchronization!
     """
-    return {
-        'market_params': {
-            'ticker': 'OP_C100', 
-            'S': 105.0, 
-            'K': 100.0, 
-            't': 0.25, 
-            'r': 0.04, 
-            'sigma': 0.30     
-        },
-        'call_bids': [],
-        'call_asks': [],
-        'last_update_time': time.time(),
-        'simulation_active': False,
-        'order_counter': 0,
-        'trade_counter': 0,
-        'students': {},  # Will be loaded from file
-        'last_file_save': time.time()
-    }
+    return GlobalState()
 
 STUDENTS_FILE = "students.json"
 
@@ -97,8 +100,8 @@ def save_students_to_file(students_dict):
 def initialize_students():
     """Load students into shared state if not already loaded."""
     shared = get_shared_state()
-    if not shared['students']:
-        shared['students'] = load_students_from_file()
+    if not shared.students:
+        shared.students = load_students_from_file()
 
 # ==============================================================================
 # 2. CORE TRADING FUNCTIONS
@@ -107,18 +110,18 @@ def initialize_students():
 def update_stock_price():
     """Update stock price using geometric Brownian motion."""
     shared = get_shared_state()
-    market = shared['market_params']
+    market = shared.market_params
     S, r, sigma = market['S'], market['r'], market['sigma']
     
-    time_elapsed = time.time() - shared['last_update_time']
+    time_elapsed = time.time() - shared.last_update_time
     delta_t_years = 60.0 / 525600.0  # 60 seconds in years
     
     Z = np.random.standard_normal()
     dS = S * (r * delta_t_years + sigma * np.sqrt(delta_t_years) * Z)
     
-    shared['market_params']['S'] = max(0.01, S + dS)
-    shared['market_params']['t'] = max(0, market['t'] - delta_t_years)
-    shared['last_update_time'] = time.time()
+    shared.market_params['S'] = max(0.01, S + dS)
+    shared.market_params['t'] = max(0, market['t'] - delta_t_years)
+    shared.last_update_time = time.time()
 
 def black_scholes_price(S, K, t, r, sigma, option_type='call'):
     """Calculate Black-Scholes option price."""
@@ -165,8 +168,8 @@ def submit_limit_order(student_id, option_type, side, price, quantity):
     shared = get_shared_state()
     book_key = 'call_bids' if side == 'BID' else 'call_asks'
     
-    shared['order_counter'] += 1
-    order_id = f"ORD_{shared['order_counter']}"
+    shared.order_counter += 1
+    order_id = f"ORD_{shared.order_counter}"
     
     order = {
         'order_id': order_id, 
@@ -177,13 +180,15 @@ def submit_limit_order(student_id, option_type, side, price, quantity):
         'time': time.time()
     }
     
-    shared[book_key].append(order)
+    # Use getattr to access the attribute dynamically
+    book = getattr(shared, book_key)
+    book.append(order)
     
     # Sort order book
     if side == 'BID':
-        shared[book_key].sort(key=lambda x: (-x['price'], x['time']))
+        book.sort(key=lambda x: (-x['price'], x['time']))
     else:
-        shared[book_key].sort(key=lambda x: (x['price'], x['time']))
+        book.sort(key=lambda x: (x['price'], x['time']))
     
     return True, f"Limit order placed: {side} {quantity} @ {price:.2f} (ID: {order_id})"
 
@@ -192,16 +197,19 @@ def cancel_order_by_id(order_id, student_id):
     shared = get_shared_state()
     
     for book_key in ['call_bids', 'call_asks']:
-        original_len = len(shared[book_key])
-        shared[book_key] = [o for o in shared[book_key] 
-                           if not (o['order_id'] == order_id and o['id'] == student_id)]
+        book = getattr(shared, book_key)
+        original_len = len(book)
+        new_book = [o for o in book 
+                   if not (o['order_id'] == order_id and o['id'] == student_id)]
         
-        if len(shared[book_key]) < original_len:
+        if len(new_book) < original_len:
             # Re-sort after removal
             if book_key == 'call_bids':
-                shared[book_key].sort(key=lambda x: (-x['price'], x['time']))
+                new_book.sort(key=lambda x: (-x['price'], x['time']))
             else:
-                shared[book_key].sort(key=lambda x: (x['price'], x['time']))
+                new_book.sort(key=lambda x: (x['price'], x['time']))
+            
+            setattr(shared, book_key, new_book)
             return True
     
     return False
@@ -209,7 +217,7 @@ def cancel_order_by_id(order_id, student_id):
 def process_market_order(taker_id, side, quantity_requested):
     """Process a market order by matching with limit orders."""
     shared = get_shared_state()
-    students = shared['students']
+    students = shared.students
     
     taker = students.get(taker_id)
     if not taker:
@@ -223,7 +231,10 @@ def process_market_order(taker_id, side, quantity_requested):
     total_cost = 0
     new_book = []
     
-    for limit_order in shared[book_key]:
+    # Get the order book using getattr
+    current_book = getattr(shared, book_key)
+    
+    for limit_order in current_book:
         if quantity_remaining <= 0:
             new_book.append(limit_order)
             continue
@@ -266,8 +277,8 @@ def process_market_order(taker_id, side, quantity_requested):
         total_cost += trade_amount
         
         # Record transaction
-        shared['trade_counter'] += 1
-        trade_id = f"TRD_{shared['trade_counter']}"
+        shared.trade_counter += 1
+        trade_id = f"TRD_{shared.trade_counter}"
         
         transaction_record = {
             'trade_id': trade_id,
@@ -287,14 +298,14 @@ def process_market_order(taker_id, side, quantity_requested):
             limit_order['quantity'] -= qty_to_trade
             new_book.append(limit_order)
     
-    # Update order book
-    shared[book_key] = new_book
+    # Update order book using setattr
+    setattr(shared, book_key, new_book)
     
     # Save to file periodically (not on every trade to avoid I/O overhead)
     current_time = time.time()
-    if current_time - shared['last_file_save'] > 5:  # Save every 5 seconds max
+    if current_time - shared.last_file_save > 5:  # Save every 5 seconds max
         save_students_to_file(students)
-        shared['last_file_save'] = current_time
+        shared.last_file_save = current_time
     
     if filled_quantity > 0:
         avg_price = total_cost / filled_quantity
@@ -322,7 +333,7 @@ def get_active_student():
     """Get the currently active student object."""
     if st.session_state.active_student_id:
         shared = get_shared_state()
-        return shared['students'].get(st.session_state.active_student_id)
+        return shared.students.get(st.session_state.active_student_id)
     return None
 
 def display_order_book():
@@ -330,8 +341,8 @@ def display_order_book():
     st.subheader("📚 Order Book (CALL Options)")
     
     shared = get_shared_state()
-    bids = shared['call_bids']
-    asks = shared['call_asks']
+    bids = shared.call_bids
+    asks = shared.call_asks
     
     col1, col2 = st.columns(2)
     
@@ -371,7 +382,7 @@ def display_order_book():
 def display_market_info():
     """Display current market parameters and pricing."""
     shared = get_shared_state()
-    market = shared['market_params']
+    market = shared.market_params
     S, K, t, r, sigma = market['S'], market['K'], market['t'], market['r'], market['sigma']
     
     st.subheader("⚙️ Market Parameters")
@@ -474,7 +485,7 @@ def display_portfolio():
     
     # Calculate P&L
     shared = get_shared_state()
-    market = shared['market_params']
+    market = shared.market_params
     current_option_value = black_scholes_price(
         market['S'], market['K'], market['t'], market['r'], market['sigma'], 'call'
     )
@@ -507,8 +518,8 @@ def display_portfolio():
     # Open orders
     st.subheader("🛑 Open Orders")
     shared = get_shared_state()
-    open_bids = [o for o in shared['call_bids'] if o['id'] == student.id]
-    open_asks = [o for o in shared['call_asks'] if o['id'] == student.id]
+    open_bids = [o for o in shared.call_bids if o['id'] == student.id]
+    open_asks = [o for o in shared.call_asks if o['id'] == student.id]
     open_orders = open_bids + open_asks
     
     if open_orders:
@@ -559,9 +570,9 @@ def main():
         query_params = st.query_params
         user_id_from_url = query_params.get("user_id")
         
-        if user_id_from_url and user_id_from_url in shared['students']:
+        if user_id_from_url and user_id_from_url in shared.students:
             st.session_state.active_student_id = user_id_from_url
-            st.session_state.user_role = shared['students'][user_id_from_url].role
+            st.session_state.user_role = shared.students[user_id_from_url].role
             st.rerun()
         
         # Show login form
@@ -577,27 +588,27 @@ def main():
             register_btn = col2.form_submit_button("📝 Register", type="secondary")
             
             if login_btn or register_btn:
-                if student_id not in shared['students']:
+                if student_id not in shared.students:
                     # Create new student
                     initial_cash = 100000.0 if role == 'MAKER' else 50000.0
-                    shared['students'][student_id] = Student(student_id, role, cash=initial_cash)
-                    save_students_to_file(shared['students'])
+                    shared.students[student_id] = Student(student_id, role, cash=initial_cash)
+                    save_students_to_file(shared.students)
                     st.success(f"✅ Registered new {role}: {student_id}")
                 
                 # Set active student
                 st.session_state.active_student_id = student_id
-                st.session_state.user_role = shared['students'][student_id].role
+                st.session_state.user_role = shared.students[student_id].role
                 st.query_params["user_id"] = student_id
                 st.rerun()
         
         # Show existing students
-        if shared['students']:
+        if shared.students:
             st.markdown("---")
             st.markdown("### 👥 Existing Students")
             students_df = pd.DataFrame([
                 {'ID': k, 'Role': v.role, 'Cash': f"${v.cash:.2f}", 
                  'Options': v.portfolio.get('OP_C100', 0)}
-                for k, v in shared['students'].items()
+                for k, v in shared.students.items()
             ])
             st.dataframe(students_df, use_container_width=True, hide_index=True)
         
@@ -623,8 +634,8 @@ def main():
         st.title("🎛️ Controls")
         
         # Simulation control
-        market_t = shared['market_params']['t']
-        sim_active = shared['simulation_active']
+        market_t = shared.market_params['t']
+        sim_active = shared.simulation_active
         
         st.subheader("⏱️ Market Simulation")
         
@@ -632,21 +643,21 @@ def main():
             st.error("⚠️ Option has expired!")
         elif not sim_active:
             if st.button("▶️ Start Simulation", type="primary", use_container_width=True):
-                shared['simulation_active'] = True
-                shared['last_update_time'] = time.time()
+                shared.simulation_active = True
+                shared.last_update_time = time.time()
                 st.rerun()
         else:
             if st.button("⏸️ Pause Simulation", type="secondary", use_container_width=True):
-                shared['simulation_active'] = False
+                shared.simulation_active = False
                 st.rerun()
             
             # Timer display
             WAIT_SECONDS = 60
-            time_elapsed = time.time() - shared['last_update_time']
+            time_elapsed = time.time() - shared.last_update_time
             
             if time_elapsed >= WAIT_SECONDS:
                 update_stock_price()
-                st.success(f"✅ Price updated: ${shared['market_params']['S']:.2f}")
+                st.success(f"✅ Price updated: ${shared.market_params['S']:.2f}")
                 st.rerun()
             else:
                 time_remaining = WAIT_SECONDS - time_elapsed
@@ -685,7 +696,7 @@ def main():
         st.markdown("---")
         st.subheader("⚙️ Admin")
         if st.button("💾 Force Save", help="Save all data to file"):
-            save_students_to_file(shared['students'])
+            save_students_to_file(shared.students)
             st.success("Data saved!")
     
     # ========== MAIN TABS ==========
