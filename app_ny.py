@@ -17,7 +17,7 @@ GLOBAL_STATE_LOCK = threading.Lock()
 
 class Student:
     """Enkel klasse for å holde Portefølje- og Kontantdata."""
-    # NØKKEL-FIKS: Beholder cash som standard, men kalles nå eksplisitt i main()
+    # NØKKEL-FIKS: 'cash' er parameteren. Kalles nå eksplisitt med 'cash=' i main()
     def __init__(self, student_id, role, cash=100000.0, portfolio=None, transactions=None):
         self.id = student_id
         self.role = role  
@@ -25,14 +25,11 @@ class Student:
         self.portfolio = portfolio if portfolio is not None else {'OP_C100': 0} 
         self.transactions = transactions if transactions is not None else [] 
     
-    # Metoder for serialisering og deserialisering
     def to_dict(self):
-        # Må inkludere alle attributter, inkludert de som brukes som nøkler under lasting
         return self.__dict__
     
     @staticmethod
     def from_dict(data):
-        # Sikrer at vi bruker riktige nøkler fra den lagrede JSON-dataen (dict)
         return Student(
             student_id=data['id'], 
             role=data['role'], 
@@ -47,21 +44,17 @@ def load_global_students():
     try:
         with open(STUDENTS_FILE, 'r') as f:
             data = json.load(f)
-            # Konverterer dict tilbake til Student-objekter
             return {k: Student.from_dict(v) for k, v in data.items()}
     except (FileNotFoundError, json.JSONDecodeError):
-        # Hvis filen ikke finnes eller er tom/korrupt, start med tom dict
         return {} 
 
 def save_global_students(students_dict):
     """Lagrer Student-objekter til JSON-fil."""
     try:
-        # Konverterer Student-objekter til dict før lagring
         data_to_save = {k: v.to_dict() for k, v in students_dict.items()}
         with open(STUDENTS_FILE, 'w') as f:
             json.dump(data_to_save, f, indent=4)
     except Exception as e:
-        # Bruker st.error for synlig feilmelding i appen
         st.error(f"Feil ved lagring av studentdata: {e}")
 
 # Initialisering av global tilstand
@@ -76,7 +69,6 @@ if 'GLOBAL_STATE_CONTAINER' not in st.session_state:
         'simulation_active': False,
         'order_counter': 0,
         'trade_counter': 0,
-        # Laster persistente data her
         'students': load_global_students() 
     }
 
@@ -85,7 +77,6 @@ if 'GLOBAL_STATE_CONTAINER' not in st.session_state:
 # ==============================================================================
 
 def initialize_state():
-    """Initialiserer Streamlit session state (kun sesjonsspesifikk data)."""
     if 'initialized_session' not in st.session_state:
         st.session_state.active_student_id = None 
         st.session_state.user_role = None
@@ -96,7 +87,6 @@ def get_global_state():
     return st.session_state.GLOBAL_STATE_CONTAINER
 
 def update_stock_price():
-    """Simulerer aksjekurs og oppdaterer GLOBAL_MARKET_STATE under lås."""
     with GLOBAL_STATE_LOCK:
         global_state = get_global_state()
         market = global_state['market_params']
@@ -114,7 +104,6 @@ def update_stock_price():
         global_state['last_update_time'] = time.time()
 
 def black_scholes_price(S, K, t, r, sigma, option_type='call'):
-    """Black-Scholes opsjonsprising."""
     if t <= 0: return max(0, S - K) if option_type == 'call' else max(0, K - S)
     d1 = (np.log(S / K) + (r + 0.5 * sigma**2) * t) / (sigma * np.sqrt(t))
     d2 = d1 - sigma * np.sqrt(t)
@@ -125,7 +114,6 @@ def black_scholes_price(S, K, t, r, sigma, option_type='call'):
     return price
 
 def black_scholes_greeks(S, K, t, r, sigma, option_type='call'):
-    """Beregner Black-Scholes grekere."""
     if t <= 0: return {'delta': 0.0, 'gamma': 0.0, 'theta': 0.0, 'vega': 0.0}
     d1 = (np.log(S / K) + (r + 0.5 * sigma**2) * t) / (sigma * np.sqrt(t))
     N_prime_d1 = norm.pdf(d1)
@@ -136,7 +124,6 @@ def black_scholes_greeks(S, K, t, r, sigma, option_type='call'):
 
 
 def submit_limit_order(student_id, option_type, side, price, quantity):
-    """Legger inn en ordre i den globale ordreboken under lås."""
     with GLOBAL_STATE_LOCK:
         if option_type != 'CALL': return False, "Kun CALL-opsjoner støttes."
         state = get_global_state()
@@ -153,7 +140,6 @@ def submit_limit_order(student_id, option_type, side, price, quantity):
             return True, f"Limitordre lagt inn: TILBUD {quantity} @ {price:.2f} (ID: {order_id})"
 
 def cancel_order_by_id(order_id, student_id):
-    """Fjerner en ordre fra ordreboken basert på ID under lås."""
     with GLOBAL_STATE_LOCK:
         state = get_global_state()
         keys = ['call_bids', 'call_asks']
@@ -173,7 +159,6 @@ def cancel_order_by_id(order_id, student_id):
         return False
 
 def process_market_order(taker_id, side, quantity_remaining):
-    """Gjennomfører en Market Order mot Limit Ordrer i den globale boken under lås."""
     with GLOBAL_STATE_LOCK:
         global_state = get_global_state()
         global_students = global_state['students']
@@ -198,7 +183,6 @@ def process_market_order(taker_id, side, quantity_remaining):
             maker_id = limit_order['id']
             maker = global_students.get(maker_id) 
             if not maker:
-                # Hvis makeren ikke er i student-dicten (skjedde før persistent lagring), hopp over ordren
                 new_limit_book.append(limit_order)
                 continue 
 
@@ -212,7 +196,6 @@ def process_market_order(taker_id, side, quantity_remaining):
             if side == 'SELL' and taker.portfolio.get('OP_C100', 0) < quantity_remaining:
                 return False, "Mangler nok opsjoner å selge!"
 
-            # --- Oppdatering av Global Student Data ---
             if side == 'BUY':
                 taker.cash -= trade_amount
                 taker.portfolio['OP_C100'] = taker.portfolio.get('OP_C100', 0) + qty_to_trade
@@ -223,9 +206,7 @@ def process_market_order(taker_id, side, quantity_remaining):
                 taker.portfolio['OP_C100'] = taker.portfolio.get('OP_C100', 0) - qty_to_trade
                 maker.cash -= trade_amount
                 maker.portfolio['OP_C100'] = maker.portfolio.get('OP_C100', 0) + qty_to_trade
-            # --- Slutt Oppdatering ---
 
-            # Oppdater Trade-logg
             quantity_remaining -= qty_to_trade
             filled_quantity += qty_to_trade
             total_cost += trade_amount
@@ -246,7 +227,7 @@ def process_market_order(taker_id, side, quantity_remaining):
         
         global_state[book_key] = new_limit_book
         
-        # KRITISK: Lagre oppdatert studentdata til filen etter handel!
+        # Lagre oppdatert studentdata til filen etter handel!
         save_global_students(global_students)
 
         if filled_quantity > 0:
@@ -262,7 +243,6 @@ def process_market_order(taker_id, side, quantity_remaining):
 # 2. UI-KOMPONENTER (Visuell presentasjon)
 # ==============================================================================
 def get_active_student():
-    """Henter den aktive studenten fra den globale beholdningen."""
     active_id = st.session_state.active_student_id
     return get_global_state()['students'].get(active_id)
 
@@ -372,7 +352,7 @@ def display_portfolio():
 # ==============================================================================
 
 def main():
-    st.set_page_config(page_title="Opsjonsmarked Simulator V16.1 (Stabil)", layout="wide")
+    st.set_page_config(page_title="Opsjonsmarked Simulator V16.2 (Stabil Fiks)", layout="wide")
     
     initialize_state()
 
@@ -404,7 +384,7 @@ def main():
                         if student_id not in global_students:
                             initial_cash = 100000.0 if role_type == 'MAKER' else 50000.0
                             
-                            # FIKSEN FOR TYPEERROR: Kaller 'cash=initial_cash' eksplisitt
+                            # ✅ LØSNING: Bruker 'cash=initial_cash' for å matche __init__ signaturen
                             global_students[student_id] = Student(student_id, role_type, cash=initial_cash) 
                         
                             # KRITISK: Lagre den nye studenten til filen!
@@ -413,7 +393,8 @@ def main():
                     # Sett ID lokalt og i URL
                     st.query_params["user_id"] = student_id
                     st.session_state.active_student_id = student_id
-                    st.session_state.user_role = role_type
+                    # Henter rolle fra den nylig opprettede/hentede studenten
+                    st.session_state.user_role = global_students[student_id].role 
                     st.rerun() 
             return 
 
