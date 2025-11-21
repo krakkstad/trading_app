@@ -3,13 +3,12 @@ from scipy.stats import norm
 import streamlit as st
 import time
 import pandas as pd
-import copy 
 import json 
 from datetime import datetime
 from pathlib import Path
 
 # ==============================================================================
-# 0. SHARED GLOBAL STATE (CRITICAL FIX!)
+# 0. SHARED GLOBAL STATE
 # ==============================================================================
 
 class GlobalState:
@@ -34,11 +33,7 @@ class GlobalState:
 
 @st.cache_resource
 def get_shared_state():
-    """
-    CRITICAL: Using @st.cache_resource creates a TRULY GLOBAL state
-    that persists across ALL user sessions and browser tabs.
-    This is the key to multi-user synchronization!
-    """
+    """Get the truly global state shared across all sessions."""
     return GlobalState()
 
 STUDENTS_FILE = "students.json"
@@ -91,7 +86,7 @@ def save_students_to_file(students_dict):
     try:
         data_to_save = {k: v.to_dict() for k, v in students_dict.items()}
         with open(STUDENTS_FILE, 'w') as f:
-            json.dump(data_to_save, f, indent=4)
+            json.dump(data_to_save, f, indent=2)
         return True
     except Exception as e:
         st.error(f"Error saving students: {e}")
@@ -113,7 +108,6 @@ def update_stock_price():
     market = shared.market_params
     S, r, sigma = market['S'], market['r'], market['sigma']
     
-    time_elapsed = time.time() - shared.last_update_time
     delta_t_years = 60.0 / 525600.0  # 60 seconds in years
     
     Z = np.random.standard_normal()
@@ -150,7 +144,6 @@ def black_scholes_greeks(S, K, t, r, sigma, option_type='call'):
     gamma = N_prime_d1 / (S * sigma * np.sqrt(t))
     vega = S * N_prime_d1 * np.sqrt(t) * 0.01
     
-    # Simplified theta calculation
     if option_type == 'call':
         theta = (-S * N_prime_d1 * sigma / (2 * np.sqrt(t)) 
                  - r * K * np.exp(-r * t) * norm.cdf(d2)) / 365
@@ -180,17 +173,16 @@ def submit_limit_order(student_id, option_type, side, price, quantity):
         'time': time.time()
     }
     
-    # Use getattr to access the attribute dynamically
     book = getattr(shared, book_key)
     book.append(order)
     
-    # Sort order book
+    # Sort order book (price-time priority)
     if side == 'BID':
         book.sort(key=lambda x: (-x['price'], x['time']))
     else:
         book.sort(key=lambda x: (x['price'], x['time']))
     
-    return True, f"Limit order placed: {side} {quantity} @ {price:.2f} (ID: {order_id})"
+    return True, f"✅ Order placed: {side} {quantity} @ ${price:.2f}"
 
 def cancel_order_by_id(order_id, student_id):
     """Cancel an order by ID."""
@@ -203,7 +195,6 @@ def cancel_order_by_id(order_id, student_id):
                    if not (o['order_id'] == order_id and o['id'] == student_id)]
         
         if len(new_book) < original_len:
-            # Re-sort after removal
             if book_key == 'call_bids':
                 new_book.sort(key=lambda x: (-x['price'], x['time']))
             else:
@@ -215,7 +206,10 @@ def cancel_order_by_id(order_id, student_id):
     return False
 
 def process_market_order(taker_id, side, quantity_requested):
-    """Process a market order by matching with limit orders."""
+    """
+    Process a market order by matching with limit orders.
+    NOW SUPPORTS SHORT SELLING - no position check!
+    """
     shared = get_shared_state()
     students = shared.students
     
@@ -231,7 +225,6 @@ def process_market_order(taker_id, side, quantity_requested):
     total_cost = 0
     new_book = []
     
-    # Get the order book using getattr
     current_book = getattr(shared, book_key)
     
     for limit_order in current_book:
@@ -251,14 +244,12 @@ def process_market_order(taker_id, side, quantity_requested):
         trade_price = limit_order['price']
         trade_amount = qty_to_trade * trade_price
         
-        # Check if taker has sufficient funds/options
+        # Check if taker has sufficient CASH (only restriction)
         if side == 'BUY':
             if taker.cash < trade_amount:
                 new_book.append(limit_order)
                 break
-        else:  # SELL
-            if taker.portfolio.get('OP_C100', 0) < qty_to_trade:
-                return False, f"Insufficient options to sell! You have {taker.portfolio.get('OP_C100', 0)}, need {quantity_requested}"
+        # REMOVED: No check for selling - short selling is allowed!
         
         # Execute trade
         if side == 'BUY':
@@ -266,7 +257,7 @@ def process_market_order(taker_id, side, quantity_requested):
             taker.portfolio['OP_C100'] = taker.portfolio.get('OP_C100', 0) + qty_to_trade
             maker.cash += trade_amount
             maker.portfolio['OP_C100'] = maker.portfolio.get('OP_C100', 0) - qty_to_trade
-        else:  # SELL
+        else:  # SELL (can go negative = short position)
             taker.cash += trade_amount
             taker.portfolio['OP_C100'] = taker.portfolio.get('OP_C100', 0) - qty_to_trade
             maker.cash -= trade_amount
@@ -298,23 +289,23 @@ def process_market_order(taker_id, side, quantity_requested):
             limit_order['quantity'] -= qty_to_trade
             new_book.append(limit_order)
     
-    # Update order book using setattr
+    # Update order book
     setattr(shared, book_key, new_book)
     
-    # Save to file periodically (not on every trade to avoid I/O overhead)
+    # Save to file periodically
     current_time = time.time()
-    if current_time - shared.last_file_save > 5:  # Save every 5 seconds max
+    if current_time - shared.last_file_save > 10:  # Save every 10 seconds (reduced frequency)
         save_students_to_file(students)
         shared.last_file_save = current_time
     
     if filled_quantity > 0:
         avg_price = total_cost / filled_quantity
-        msg = f"Market order executed: {filled_quantity} contracts @ ${avg_price:.2f} avg."
+        msg = f"✅ Filled {filled_quantity} @ ${avg_price:.2f}"
         if quantity_remaining > 0:
             msg += f" ({quantity_remaining} unfilled)"
         return True, msg
     else:
-        return False, "Market order failed: No liquidity available at current prices."
+        return False, "❌ No liquidity available"
 
 # ==============================================================================
 # 3. UI COMPONENTS
@@ -326,7 +317,6 @@ def initialize_session_state():
         st.session_state.active_student_id = None
         st.session_state.user_role = None
         st.session_state.status_message = None
-        st.session_state.auto_refresh = True
         st.session_state.initialized = True
 
 def get_active_student():
@@ -338,8 +328,6 @@ def get_active_student():
 
 def display_order_book():
     """Display the current order book."""
-    st.subheader("📚 Order Book (CALL Options)")
-    
     shared = get_shared_state()
     bids = shared.call_bids
     asks = shared.call_asks
@@ -347,37 +335,35 @@ def display_order_book():
     col1, col2 = st.columns(2)
     
     with col1:
-        st.markdown("**🟢 BIDS (Buy Orders)**")
+        st.markdown("**🟢 BIDS**")
         if bids:
-            df_bids = pd.DataFrame(bids[:10])  # Show top 10
-            df_bids = df_bids[['price', 'quantity', 'id', 'order_id']]
-            df_bids.columns = ['Price', 'Quantity', 'Maker', 'Order ID']
+            df_bids = pd.DataFrame(bids[:5])
+            df_bids = df_bids[['price', 'quantity', 'id']]
+            df_bids.columns = ['Price', 'Qty', 'Maker']
             st.dataframe(df_bids, use_container_width=True, hide_index=True)
         else:
-            st.info("No buy orders")
+            st.info("No bids")
     
     with col2:
-        st.markdown("**🔴 ASKS (Sell Orders)**")
+        st.markdown("**🔴 ASKS**")
         if asks:
-            df_asks = pd.DataFrame(asks[:10])  # Show top 10
-            df_asks = df_asks[['price', 'quantity', 'id', 'order_id']]
-            df_asks.columns = ['Price', 'Quantity', 'Maker', 'Order ID']
+            df_asks = pd.DataFrame(asks[:5])
+            df_asks = df_asks[['price', 'quantity', 'id']]
+            df_asks.columns = ['Price', 'Qty', 'Maker']
             st.dataframe(df_asks, use_container_width=True, hide_index=True)
         else:
-            st.info("No sell orders")
+            st.info("No asks")
     
-    # Show best bid/ask
-    best_bid = bids[0]['price'] if bids else None
-    best_ask = asks[0]['price'] if asks else None
-    
-    col_spread = st.columns(3)
-    if best_bid:
-        col_spread[0].metric("Best Bid", f"${best_bid:.2f}")
-    if best_ask:
-        col_spread[1].metric("Best Ask", f"${best_ask:.2f}")
-    if best_bid and best_ask:
+    # Show spread
+    if bids and asks:
+        best_bid = bids[0]['price']
+        best_ask = asks[0]['price']
         spread = best_ask - best_bid
-        col_spread[2].metric("Spread", f"${spread:.2f}")
+        
+        col_s1, col_s2, col_s3 = st.columns(3)
+        col_s1.metric("Best Bid", f"${best_bid:.2f}")
+        col_s2.metric("Best Ask", f"${best_ask:.2f}")
+        col_s3.metric("Spread", f"${spread:.2f}")
 
 def display_market_info():
     """Display current market parameters and pricing."""
@@ -385,33 +371,24 @@ def display_market_info():
     market = shared.market_params
     S, K, t, r, sigma = market['S'], market['K'], market['t'], market['r'], market['sigma']
     
-    st.subheader("⚙️ Market Parameters")
+    # Compact market params
+    col1, col2, col3, col4, col5 = st.columns(5)
+    col1.metric("Stock (S)", f"${S:.2f}")
+    col2.metric("Strike (K)", f"${K:.2f}")
+    col3.metric("Time (t)", f"{t:.4f}y")
+    col4.metric("Rate (r)", f"{r*100:.1f}%")
+    col5.metric("Vol (σ)", f"{sigma*100:.0f}%")
     
-    col1, col2, col3 = st.columns(3)
-    col1.metric("Underlying Price (S)", f"${S:.2f}")
-    col2.metric("Strike Price (K)", f"${K:.2f}")
-    col3.metric("Time to Expiry", f"{t:.4f} years")
-    
-    col4, col5 = st.columns(2)
-    col4.metric("Risk-free Rate", f"{r*100:.2f}%")
-    col5.metric("Volatility (σ)", f"{sigma*100:.2f}%")
-    
-    # Calculate fair values
+    # Fair values
     call_price = black_scholes_price(S, K, t, r, sigma, 'call')
-    put_price = black_scholes_price(S, K, t, r, sigma, 'put')
     call_greeks = black_scholes_greeks(S, K, t, r, sigma, 'call')
     
-    st.subheader("💰 Black-Scholes Fair Values")
-    col_price1, col_price2 = st.columns(2)
-    col_price1.metric("Call Option", f"${call_price:.4f}")
-    col_price2.metric("Put Option", f"${put_price:.4f}")
-    
-    st.subheader("📐 Option Greeks (Call)")
-    col_g1, col_g2, col_g3, col_g4 = st.columns(4)
-    col_g1.metric("Delta (Δ)", f"{call_greeks['delta']:.4f}")
-    col_g2.metric("Gamma (Γ)", f"{call_greeks['gamma']:.6f}")
-    col_g3.metric("Theta (Θ)", f"{call_greeks['theta']:.4f}")
-    col_g4.metric("Vega (ν)", f"{call_greeks['vega']:.4f}")
+    col_p1, col_p2, col_p3, col_p4, col_p5 = st.columns(5)
+    col_p1.metric("Fair Value", f"${call_price:.3f}")
+    col_p2.metric("Δ", f"{call_greeks['delta']:.3f}")
+    col_p3.metric("Γ", f"{call_greeks['gamma']:.5f}")
+    col_p4.metric("Θ", f"{call_greeks['theta']:.4f}")
+    col_p5.metric("ν", f"{call_greeks['vega']:.3f}")
     
     st.markdown("---")
     display_order_book()
@@ -423,26 +400,31 @@ def trading_interface():
         st.error("Student not found!")
         return
     
+    # Show portfolio summary at top
+    position = student.portfolio.get('OP_C100', 0)
+    position_color = "🔴" if position < 0 else "🟢" if position > 0 else "⚪"
+    
+    col_top1, col_top2 = st.columns(2)
+    col_top1.metric("💰 Cash", f"${student.cash:.2f}")
+    col_top2.metric(f"{position_color} Position", f"{position:+d} contracts", 
+                    help="Negative = Short position")
+    
     if student.role == 'MAKER':
-        st.subheader("✍️ Submit Limit Order (Market Maker)")
-        st.info(f"💰 Cash: ${student.cash:.2f} | 📊 Options: {student.portfolio.get('OP_C100', 0)}")
+        st.subheader("Market Maker: Submit Limit Order")
         
         with st.form("maker_form", clear_on_submit=True):
-            col1, col2 = st.columns(2)
+            col1, col2, col3 = st.columns(3)
             
-            option_type = col1.selectbox("Option Type", ['CALL'], key='maker_opt')
-            side = col2.selectbox("Order Side", ['BID', 'ASK'], key='maker_side')
+            side = col1.selectbox("Side", ['BID', 'ASK'], key='m_side')
+            price = col2.number_input("Price", min_value=0.01, value=10.0, 
+                                     format="%.2f", key="m_price")
+            quantity = col3.number_input("Qty", min_value=1, value=10, 
+                                        step=1, key="m_qty")
             
-            col3, col4 = st.columns(2)
-            price = col3.number_input("Limit Price", min_value=0.01, value=10.0, 
-                                     format="%.2f", key="maker_price")
-            quantity = col4.number_input("Quantity", min_value=1, value=1, 
-                                        step=1, key="maker_qty")
-            
-            submitted = st.form_submit_button("📝 Submit Limit Order", type="primary")
+            submitted = st.form_submit_button("📝 Submit Order", type="primary", use_container_width=True)
             
             if submitted:
-                success, msg = submit_limit_order(student.id, option_type, side, price, quantity)
+                success, msg = submit_limit_order(student.id, 'CALL', side, price, quantity)
                 st.session_state.status_message = {
                     'type': 'success' if success else 'error',
                     'content': msg
@@ -450,17 +432,17 @@ def trading_interface():
                 st.rerun()
     
     elif student.role == 'TRADER':
-        st.subheader("💸 Submit Market Order (Trader)")
-        st.info(f"💰 Cash: ${student.cash:.2f} | 📊 Options: {student.portfolio.get('OP_C100', 0)}")
+        st.subheader("Trader: Submit Market Order")
+        st.caption("ℹ️ Short selling enabled - you can sell even with 0 or negative position")
         
         with st.form("trader_form", clear_on_submit=True):
             col1, col2 = st.columns(2)
             
-            side = col1.selectbox("Order Side", ['BUY', 'SELL'], key='trader_side')
-            quantity = col2.number_input("Quantity", min_value=1, value=1, 
-                                        step=1, key="trader_qty")
+            side = col1.selectbox("Side", ['BUY', 'SELL'], key='t_side')
+            quantity = col2.number_input("Qty", min_value=1, value=5, 
+                                        step=1, key="t_qty")
             
-            submitted = st.form_submit_button(f"🚀 Execute Market {side}", type="primary")
+            submitted = st.form_submit_button(f"🚀 {side}", type="primary", use_container_width=True)
             
             if submitted:
                 success, msg = process_market_order(student.id, side, quantity)
@@ -477,46 +459,56 @@ def display_portfolio():
         st.error("Student not found!")
         return
     
-    st.subheader(f"👤 Portfolio: {student.id} ({student.role})")
+    st.subheader(f"Portfolio: {student.id}")
     
-    col1, col2 = st.columns(2)
-    col1.metric("💰 Cash Balance", f"${student.cash:.2f}")
-    col2.metric("📊 Options Position", f"{student.portfolio.get('OP_C100', 0)} contracts")
+    # Portfolio summary
+    position = student.portfolio.get('OP_C100', 0)
     
-    # Calculate P&L
+    # Calculate mark-to-market
     shared = get_shared_state()
     market = shared.market_params
     current_option_value = black_scholes_price(
         market['S'], market['K'], market['t'], market['r'], market['sigma'], 'call'
     )
     
-    portfolio_value = student.cash + (student.portfolio.get('OP_C100', 0) * current_option_value)
+    position_value = position * current_option_value
+    total_value = student.cash + position_value
     initial_value = 100000.0 if student.role == 'MAKER' else 50000.0
-    pnl = portfolio_value - initial_value
+    pnl = total_value - initial_value
     pnl_pct = (pnl / initial_value) * 100
     
-    col3, col4 = st.columns(2)
-    col3.metric("📈 Portfolio Value", f"${portfolio_value:.2f}")
+    col1, col2, col3, col4 = st.columns(4)
+    col1.metric("💰 Cash", f"${student.cash:.2f}")
+    
+    # Show position with color coding
+    if position < 0:
+        col2.metric("📊 Position", f"{position} (SHORT)", delta="⚠️ Short", delta_color="inverse")
+    elif position > 0:
+        col2.metric("📊 Position", f"{position} (LONG)", delta="✓ Long", delta_color="normal")
+    else:
+        col2.metric("📊 Position", f"{position} (FLAT)")
+    
+    col3.metric("📈 Total Value", f"${total_value:.2f}")
     col4.metric("💹 P&L", f"${pnl:.2f}", f"{pnl_pct:+.2f}%")
+    
+    if position != 0:
+        st.info(f"Position Value: {position} × ${current_option_value:.3f} = ${position_value:.2f}")
     
     st.markdown("---")
     
-    # Transaction history
-    st.subheader("📋 Transaction History")
+    # Transaction history (last 10)
+    st.subheader("Recent Transactions")
     if student.transactions:
-        df_trades = pd.DataFrame(student.transactions)
-        # Reorder columns for better display
-        cols = ['time', 'trade_id', 'side', 'quantity', 'price', 'taker', 'maker']
+        df_trades = pd.DataFrame(student.transactions[-10:][::-1])  # Last 10, reversed
+        cols = ['time', 'side', 'quantity', 'price', 'maker', 'taker']
         df_trades = df_trades[[c for c in cols if c in df_trades.columns]]
-        df_trades.columns = ['Time', 'Trade ID', 'Side', 'Qty', 'Price', 'Taker', 'Maker']
         st.dataframe(df_trades, use_container_width=True, hide_index=True)
     else:
         st.info("No transactions yet")
     
-    st.markdown("---")
-    
     # Open orders
-    st.subheader("🛑 Open Orders")
+    st.markdown("---")
+    st.subheader("Open Orders")
     shared = get_shared_state()
     open_bids = [o for o in shared.call_bids if o['id'] == student.id]
     open_asks = [o for o in shared.call_asks if o['id'] == student.id]
@@ -525,19 +517,18 @@ def display_portfolio():
     if open_orders:
         df_orders = pd.DataFrame(open_orders)
         df_orders = df_orders[['order_id', 'side', 'price', 'quantity']]
-        df_orders.columns = ['Order ID', 'Side', 'Price', 'Quantity']
         st.dataframe(df_orders, use_container_width=True, hide_index=True)
         
         with st.form("cancel_form"):
             order_to_cancel = st.selectbox(
-                "Select Order to Cancel", 
+                "Cancel Order", 
                 [o['order_id'] for o in open_orders]
             )
-            cancel_btn = st.form_submit_button("❌ Cancel Order", type="secondary")
+            cancel_btn = st.form_submit_button("❌ Cancel", type="secondary")
             
             if cancel_btn:
                 success = cancel_order_by_id(order_to_cancel, student.id)
-                msg = f"Order {order_to_cancel} cancelled" if success else "Cancellation failed"
+                msg = f"Cancelled {order_to_cancel}" if success else "Cancel failed"
                 st.session_state.status_message = {
                     'type': 'success' if success else 'error',
                     'content': msg
@@ -554,8 +545,7 @@ def main():
     st.set_page_config(
         page_title="Options Market Simulator",
         page_icon="📈",
-        layout="wide",
-        initial_sidebar_state="expanded"
+        layout="wide"
     )
     
     # Initialize
@@ -577,23 +567,20 @@ def main():
         
         # Show login form
         st.title("🏛️ Options Market Simulator")
-        st.markdown("### Login or Register")
         
         with st.form("login_form"):
-            student_id = st.text_input("Student ID", value="Student_A")
-            role = st.selectbox("Role", ['MAKER', 'TRADER'])
-            
             col1, col2 = st.columns(2)
-            login_btn = col1.form_submit_button("🔐 Login", type="primary")
-            register_btn = col2.form_submit_button("📝 Register", type="secondary")
+            student_id = col1.text_input("Student ID", value="")
+            role = col2.selectbox("Role", ['MAKER', 'TRADER'])
             
-            if login_btn or register_btn:
+            login_btn = st.form_submit_button("🚀 Start Trading", type="primary", use_container_width=True)
+            
+            if login_btn and student_id:
                 if student_id not in shared.students:
                     # Create new student
                     initial_cash = 100000.0 if role == 'MAKER' else 50000.0
                     shared.students[student_id] = Student(student_id, role, cash=initial_cash)
                     save_students_to_file(shared.students)
-                    st.success(f"✅ Registered new {role}: {student_id}")
                 
                 # Set active student
                 st.session_state.active_student_id = student_id
@@ -601,106 +588,78 @@ def main():
                 st.query_params["user_id"] = student_id
                 st.rerun()
         
-        # Show existing students
-        if shared.students:
-            st.markdown("---")
-            st.markdown("### 👥 Existing Students")
-            students_df = pd.DataFrame([
-                {'ID': k, 'Role': v.role, 'Cash': f"${v.cash:.2f}", 
-                 'Options': v.portfolio.get('OP_C100', 0)}
-                for k, v in shared.students.items()
-            ])
-            st.dataframe(students_df, use_container_width=True, hide_index=True)
-        
         return
     
     # ========== MAIN INTERFACE ==========
     
-    # Title and status
-    st.title(f"🏛️ Options Market Simulator")
-    st.caption(f"Logged in as: **{st.session_state.active_student_id}** ({st.session_state.user_role})")
+    # Header
+    col_h1, col_h2, col_h3 = st.columns([2, 1, 1])
+    col_h1.title(f"📈 Options Market")
+    col_h2.write("")
+    col_h2.caption(f"**{st.session_state.active_student_id}** ({st.session_state.user_role})")
     
     # Display status messages
     if st.session_state.status_message:
         msg = st.session_state.status_message
+        msg_container = st.empty()
         if msg['type'] == 'success':
-            st.success(msg['content'])
+            msg_container.success(msg['content'])
         else:
-            st.error(msg['content'])
+            msg_container.error(msg['content'])
         st.session_state.status_message = None
     
     # ========== SIDEBAR CONTROLS ==========
     with st.sidebar:
-        st.title("🎛️ Controls")
+        st.title("⚙️ Controls")
         
         # Simulation control
         market_t = shared.market_params['t']
         sim_active = shared.simulation_active
         
-        st.subheader("⏱️ Market Simulation")
-        
         if market_t <= 0:
-            st.error("⚠️ Option has expired!")
+            st.error("⚠️ Expired")
         elif not sim_active:
-            if st.button("▶️ Start Simulation", type="primary", use_container_width=True):
+            if st.button("▶️ Start Sim", use_container_width=True):
                 shared.simulation_active = True
                 shared.last_update_time = time.time()
                 st.rerun()
         else:
-            if st.button("⏸️ Pause Simulation", type="secondary", use_container_width=True):
+            if st.button("⏸️ Pause", use_container_width=True):
                 shared.simulation_active = False
                 st.rerun()
             
-            # Timer display
+            # Timer
             WAIT_SECONDS = 60
             time_elapsed = time.time() - shared.last_update_time
             
             if time_elapsed >= WAIT_SECONDS:
                 update_stock_price()
-                st.success(f"✅ Price updated: ${shared.market_params['S']:.2f}")
                 st.rerun()
             else:
                 time_remaining = WAIT_SECONDS - time_elapsed
-                st.info(f"⏳ Next update in: {int(time_remaining)+1}s")
+                st.caption(f"⏳ Update in {int(time_remaining)}s")
         
         st.markdown("---")
         
-        # Auto-refresh toggle
-        st.subheader("🔄 Auto-Refresh")
-        auto_refresh = st.checkbox(
-            "Enable auto-refresh (5s)", 
-            value=st.session_state.auto_refresh,
-            help="Automatically refresh to see other users' orders"
-        )
-        st.session_state.auto_refresh = auto_refresh
-        
-        if auto_refresh:
-            st.caption("Auto-refreshing every 5 seconds...")
-            time.sleep(5)
+        # Quick actions
+        if st.button("🔄 Refresh", use_container_width=True):
             st.rerun()
         
-        # Manual refresh button
-        if st.button("🔄 Refresh Now", use_container_width=True):
-            st.rerun()
-        
-        st.markdown("---")
-        
-        # Logout
         if st.button("🚪 Logout", use_container_width=True):
             st.session_state.active_student_id = None
             st.session_state.user_role = None
             st.query_params.clear()
             st.rerun()
         
-        # Admin controls
         st.markdown("---")
-        st.subheader("⚙️ Admin")
-        if st.button("💾 Force Save", help="Save all data to file"):
-            save_students_to_file(shared.students)
-            st.success("Data saved!")
+        
+        # Stats
+        st.caption(f"📊 Orders: {len(shared.call_bids)} bids, {len(shared.call_asks)} asks")
+        st.caption(f"👥 Students: {len(shared.students)}")
+        st.caption(f"💱 Trades: {shared.trade_counter}")
     
     # ========== MAIN TABS ==========
-    tab1, tab2, tab3 = st.tabs(["📊 Market Info", "💱 Trading", "📁 Portfolio"])
+    tab1, tab2, tab3 = st.tabs(["📊 Market", "💱 Trade", "📁 Portfolio"])
     
     with tab1:
         display_market_info()
