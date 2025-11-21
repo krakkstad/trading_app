@@ -6,18 +6,18 @@ import pandas as pd
 import random
 import copy 
 import threading 
-import json # NYTT: For å lagre/laste til/fra JSON
+import json 
 
 # ==============================================================================
 # 0. GLOBAL MARKEDSTILSTAND OG FIL-LAGRING
 # ==============================================================================
-# Setter opp GLOBAL_STATE_CONTAINER og den nye lagringsmekanismen
 
-STUDENTS_FILE = "students.json" # Filnavnet for persistent lagring
+STUDENTS_FILE = "students.json" 
 GLOBAL_STATE_LOCK = threading.Lock() 
 
 class Student:
     """Enkel klasse for å holde Portefølje- og Kontantdata."""
+    # NØKKEL-FIKS: Beholder cash som standard, men kalles nå eksplisitt i main()
     def __init__(self, student_id, role, cash=100000.0, portfolio=None, transactions=None):
         self.id = student_id
         self.role = role  
@@ -25,12 +25,14 @@ class Student:
         self.portfolio = portfolio if portfolio is not None else {'OP_C100': 0} 
         self.transactions = transactions if transactions is not None else [] 
     
-    # NYTT: Metoder for serialisering og deserialisering
+    # Metoder for serialisering og deserialisering
     def to_dict(self):
+        # Må inkludere alle attributter, inkludert de som brukes som nøkler under lasting
         return self.__dict__
     
     @staticmethod
     def from_dict(data):
+        # Sikrer at vi bruker riktige nøkler fra den lagrede JSON-dataen (dict)
         return Student(
             student_id=data['id'], 
             role=data['role'], 
@@ -48,7 +50,8 @@ def load_global_students():
             # Konverterer dict tilbake til Student-objekter
             return {k: Student.from_dict(v) for k, v in data.items()}
     except (FileNotFoundError, json.JSONDecodeError):
-        return {} # Returnerer tom dict hvis filen er tom eller ikke finnes
+        # Hvis filen ikke finnes eller er tom/korrupt, start med tom dict
+        return {} 
 
 def save_global_students(students_dict):
     """Lagrer Student-objekter til JSON-fil."""
@@ -58,6 +61,7 @@ def save_global_students(students_dict):
         with open(STUDENTS_FILE, 'w') as f:
             json.dump(data_to_save, f, indent=4)
     except Exception as e:
+        # Bruker st.error for synlig feilmelding i appen
         st.error(f"Feil ved lagring av studentdata: {e}")
 
 # Initialisering av global tilstand
@@ -72,11 +76,12 @@ if 'GLOBAL_STATE_CONTAINER' not in st.session_state:
         'simulation_active': False,
         'order_counter': 0,
         'trade_counter': 0,
-        'students': load_global_students() # Laster PERSISTENT DATA ved oppstart
+        # Laster persistente data her
+        'students': load_global_students() 
     }
 
 # ==============================================================================
-# 1. KJERNEFUNKSJONER (Logikk - oppdatert for global student-henting/lagring)
+# 1. KJERNEFUNKSJONER (Logikk)
 # ==============================================================================
 
 def initialize_state():
@@ -95,7 +100,6 @@ def update_stock_price():
     with GLOBAL_STATE_LOCK:
         global_state = get_global_state()
         market = global_state['market_params']
-        # ... (resten av funksjonen er uendret) ...
         S, r, sigma = market['S'], market['r'], market['sigma']
         last_time = global_state['last_update_time']
         
@@ -109,7 +113,28 @@ def update_stock_price():
         global_state['market_params']['t'] = max(0, market['t'] - delta_t_years)
         global_state['last_update_time'] = time.time()
 
-# submit_limit_order er uendret.
+def black_scholes_price(S, K, t, r, sigma, option_type='call'):
+    """Black-Scholes opsjonsprising."""
+    if t <= 0: return max(0, S - K) if option_type == 'call' else max(0, K - S)
+    d1 = (np.log(S / K) + (r + 0.5 * sigma**2) * t) / (sigma * np.sqrt(t))
+    d2 = d1 - sigma * np.sqrt(t)
+    if option_type == 'call':
+        price = S * norm.cdf(d1) - K * np.exp(-r * t) * norm.cdf(d2)
+    else:
+        price = K * np.exp(-r * t) * norm.cdf(-d2) - S * norm.cdf(-d1)
+    return price
+
+def black_scholes_greeks(S, K, t, r, sigma, option_type='call'):
+    """Beregner Black-Scholes grekere."""
+    if t <= 0: return {'delta': 0.0, 'gamma': 0.0, 'theta': 0.0, 'vega': 0.0}
+    d1 = (np.log(S / K) + (r + 0.5 * sigma**2) * t) / (sigma * np.sqrt(t))
+    N_prime_d1 = norm.pdf(d1)
+    delta = norm.cdf(d1) if option_type == 'call' else norm.cdf(d1) - 1
+    gamma = N_prime_d1 / (S * sigma * np.sqrt(t))
+    vega = S * N_prime_d1 * np.sqrt(t) * 0.01 
+    return {'delta': delta, 'gamma': gamma, 'theta': 0.0, 'vega': vega}
+
+
 def submit_limit_order(student_id, option_type, side, price, quantity):
     """Legger inn en ordre i den globale ordreboken under lås."""
     with GLOBAL_STATE_LOCK:
@@ -127,7 +152,6 @@ def submit_limit_order(student_id, option_type, side, price, quantity):
             state[book_key].sort(key=lambda x: x['price'])
             return True, f"Limitordre lagt inn: TILBUD {quantity} @ {price:.2f} (ID: {order_id})"
 
-# cancel_order_by_id er uendret.
 def cancel_order_by_id(order_id, student_id):
     """Fjerner en ordre fra ordreboken basert på ID under lås."""
     with GLOBAL_STATE_LOCK:
@@ -148,12 +172,11 @@ def cancel_order_by_id(order_id, student_id):
                 return True
         return False
 
-# process_market_order er oppdatert for å lagre data.
 def process_market_order(taker_id, side, quantity_remaining):
     """Gjennomfører en Market Order mot Limit Ordrer i den globale boken under lås."""
     with GLOBAL_STATE_LOCK:
         global_state = get_global_state()
-        global_students = global_state['students'] # Hent global student-dict
+        global_students = global_state['students']
         
         taker = global_students.get(taker_id) 
         if not taker: return False, "Taker student not found."
@@ -175,6 +198,7 @@ def process_market_order(taker_id, side, quantity_remaining):
             maker_id = limit_order['id']
             maker = global_students.get(maker_id) 
             if not maker:
+                # Hvis makeren ikke er i student-dicten (skjedde før persistent lagring), hopp over ordren
                 new_limit_book.append(limit_order)
                 continue 
 
@@ -233,31 +257,122 @@ def process_market_order(taker_id, side, quantity_remaining):
         else:
             return False, f"Market Order feilet: Ukjent feil."
 
-# ... (Kopi av UI-funksjonene fra V15.0: black_scholes_price, black_scholes_greeks, 
-# get_active_student, display_order_book, display_market_info, trading_interface, 
-# display_portfolio - disse er uendret) ...
 
-# --- Kopi av UI-komponenter og Black-Scholes funksjoner ---
-# ...
-# For å unngå å gjenta 400 linjer kode, antar jeg at du kopierer disse
-# uendrede funksjonene fra V15.0 inn her. Hvis du trenger dem, si fra!
-# ...
-# Bare 'get_active_student()' endres:
-
+# ==============================================================================
+# 2. UI-KOMPONENTER (Visuell presentasjon)
+# ==============================================================================
 def get_active_student():
     """Henter den aktive studenten fra den globale beholdningen."""
     active_id = st.session_state.active_student_id
-    # Merk: henter fra global state, som ble lastet fra filen
     return get_global_state()['students'].get(active_id)
 
-# Kopi av alle de andre UI-funksjonene må settes inn her.
+def display_order_book():
+    st.subheader("📚 Ordrebok Status (CALL)")
+    state = get_global_state()
+    bids, asks = state['call_bids'], state['call_asks']
+    df_bids = pd.DataFrame(bids).drop(columns=['time', 'side']) if bids else pd.DataFrame(columns=['order_id', 'id', 'price', 'quantity'])
+    df_asks = pd.DataFrame(asks).drop(columns=['time', 'side']) if asks else pd.DataFrame(columns=['order_id', 'id', 'price', 'quantity'])
+    col_books = st.columns(2)
+    with col_books[0]:
+        st.caption("Bud (BIDS - Kjøpere)")
+        st.dataframe(df_bids.head(5).rename(columns={'id': 'Maker ID'}), use_container_width=True)
+    with col_books[1]:
+        st.caption("Tilbud (ASKS - Selgere)")
+        st.dataframe(df_asks.head(5).rename(columns={'id': 'Maker ID'}), use_container_width=True)
+
+def display_market_info():
+    market = get_global_state()['market_params']
+    S, K, t, r, sigma = market['S'], market['K'], market['t'], market['r'], market['sigma']
+    st.subheader("⚙️ Nåværende Markedsforhold")
+    col_params = st.columns(3)
+    col_params[0].metric("Underliggende Pris (S)", f"${S:.2f}")
+    col_params[1].metric("Innfrielseskurs (K)", f"${K:.2f}")
+    col_params[2].metric("Tid til Utløp (t)", f"{t:.4f} år")
+    call_price = black_scholes_price(S, K, t, r, sigma, 'call')
+    put_price = black_scholes_price(S, K, t, r, sigma, 'put')
+    call_greeks = black_scholes_greeks(S, K, t, r, sigma, 'call')
+    st.subheader("💰 Black-Scholes Fair Value")
+    col_price = st.columns(2)
+    col_price[0].metric("Call Opsjon", f"${call_price:.4f}")
+    col_price[1].metric("Put Opsjon", f"${put_price:.4f}")
+    st.subheader("📐 Opsjonsgrekere (Call)")
+    g_cols = st.columns(4)
+    g_cols[0].metric("Delta (Δ)", f"{call_greeks['delta']:.4f}")
+    g_cols[1].metric("Gamma (Γ)", f"{call_greeks['gamma']:.4f}")
+    g_cols[2].metric("Theta (Θ)", f"{call_greeks['theta']:.4f}")
+    g_cols[3].metric("Vega (ν)", f"{call_greeks['vega']:.4f}")
+    st.markdown("---")
+    display_order_book()
+
+def trading_interface():
+    active_student = get_active_student()
+    
+    if active_student.role == 'MAKER':
+        st.subheader("✍️ Legg Inn Limit Order (Market Maker)")
+        with st.form("maker_form"):
+            col_type = st.columns(2)
+            option_type = col_type[0].selectbox("Opsjonstype", ['CALL'])
+            side = col_type[1].selectbox("Ordre Side", ['BID (Kjøp)', 'ASK (Salg)'])
+            col_order = st.columns(2)
+            price = col_order[0].number_input("Limit Pris per Kontrakt", min_value=0.01, format="%.2f", key="maker_price")
+            quantity = col_order[1].number_input("Antall Kontrakter", min_value=1, step=1, key="maker_qty")
+            submitted = st.form_submit_button("Send Limit Order", type="primary")
+            if submitted:
+                side_key = side.split(' ')[0]
+                success, msg = submit_limit_order(active_student.id, option_type, side_key, price, quantity)
+                if success: st.session_state.status_message = {'type': 'success', 'content': msg}
+                else: st.session_state.status_message = {'type': 'error', 'content': msg}
+                st.rerun() 
+    
+    elif active_student.role == 'TRADER':
+        st.subheader("💸 Send Market Order (Trader)")
+        st.info(f"Din kontantsaldo: ${active_student.cash:.2f} | Opsjoner: {active_student.portfolio.get('OP_C100', 0)}")
+        with st.form("trader_form"):
+            col_type = st.columns(2)
+            side = col_type[0].selectbox("Ordre Side", ['BUY', 'SELL'])
+            quantity = col_type[1].number_input("Antall Kontrakter", min_value=1, step=1, key="trader_qty")
+            submitted = st.form_submit_button(f"Send Market {side}", type="primary")
+            if submitted:
+                success, msg = process_market_order(active_student.id, side, quantity)
+                if success: st.session_state.status_message = {'type': 'success', 'content': msg}
+                else: st.session_state.status_message = {'type': 'error', 'content': msg}
+                st.rerun() 
+
+def display_portfolio():
+    student = get_active_student()
+    st.subheader(f"👤 Porteføljeoppsummering for {student.id} (Rolle: {student.role})")
+    col_metrics = st.columns(2)
+    col_metrics[0].metric("Tilgjengelig Kontantbeholdning", f"${student.cash:.2f}")
+    col_metrics[1].metric("Opsjonsbeholdning (OP_C100)", f"{student.portfolio.get('OP_C100', 0)}")
+    st.subheader("📋 Transaksjonslogg")
+    if student.transactions:
+        df_trades = pd.DataFrame(student.transactions)
+        st.dataframe(df_trades, use_container_width=True)
+    else: st.info("Ingen gjennomførte handler.")
+    st.subheader("🛑 Åpne Limitordrer (Kansellering)")
+    open_bids = [o for o in get_global_state()['call_bids'] if o['id'] == student.id]
+    open_asks = [o for o in get_global_state()['call_asks'] if o['id'] == student.id]
+    open_orders = open_bids + open_asks
+    if open_orders:
+        df_orders = pd.DataFrame(open_orders).drop(columns=['id', 'time'])
+        df_orders = df_orders.rename(columns={'order_id': 'ID', 'price': 'Pris', 'quantity': 'Antall', 'side': 'Side'})
+        st.dataframe(df_orders, use_container_width=True)
+        with st.form("cancel_form"):
+            order_to_cancel = st.selectbox("Velg Ordre ID for kansellering", df_orders['ID'].tolist())
+            cancel_submitted = st.form_submit_button("❌ Kanseller Ordre", type="secondary")
+            if cancel_submitted:
+                success = cancel_order_by_id(order_to_cancel, student.id)
+                if success: st.session_state.status_message = {'type': 'success', 'content': f"Ordre {order_to_cancel} kansellert."}
+                else: st.session_state.status_message = {'type': 'error', 'content': f"Kansellering feilet for ID {order_to_cancel}."}
+                st.rerun() 
+    else: st.info("Ingen åpne limitordrer.")
 
 # ==============================================================================
-# 3. HOVED APPLIKASJONSFLYT (Automatisk Pålogging med Persistent Data)
+# 3. HOVED APPLIKASJONSFLYT
 # ==============================================================================
 
 def main():
-    st.set_page_config(page_title="Opsjonsmarked Simulator V16 (Persistent Data)", layout="wide")
+    st.set_page_config(page_title="Opsjonsmarked Simulator V16.1 (Stabil)", layout="wide")
     
     initialize_state()
 
@@ -288,10 +403,12 @@ def main():
                     with GLOBAL_STATE_LOCK: # Sikker opprettelse/henting
                         if student_id not in global_students:
                             initial_cash = 100000.0 if role_type == 'MAKER' else 50000.0
-                            global_students[student_id] = Student(student_id, role_type, initial_cash=initial_cash)
+                            
+                            # FIKSEN FOR TYPEERROR: Kaller 'cash=initial_cash' eksplisitt
+                            global_students[student_id] = Student(student_id, role_type, cash=initial_cash) 
                         
-                        # KRITISK: Lagre den nye studenten til filen!
-                        save_global_students(global_students) 
+                            # KRITISK: Lagre den nye studenten til filen!
+                            save_global_students(global_students) 
                     
                     # Sett ID lokalt og i URL
                     st.query_params["user_id"] = student_id
@@ -304,7 +421,6 @@ def main():
     
     st.title(f"🏛️ Opsjonsmarked Simulator (Rolle: {st.session_state.user_role})")
     
-    # ... (Resten av main() er uendret) ...
     # Statusmeldinger (Sesjonsspesifikk)
     status_msg_placeholder = st.empty()
     if st.session_state.status_message:
@@ -361,13 +477,4 @@ def main():
     with tab3: display_portfolio()
 
 if __name__ == '__main__':
-    # Midlertidig kaller de uendrede funksjonene for å unngå NameError i eksemplet
-    # Du må sørge for at disse er kopiert inn!
-    def black_scholes_price(*args, **kwargs): return 0.0 
-    def black_scholes_greeks(*args, **kwargs): return {'delta': 0.0, 'gamma': 0.0, 'theta': 0.0, 'vega': 0.0}
-    def display_order_book(): st.empty()
-    def display_market_info(): st.empty()
-    def trading_interface(): st.empty()
-    def display_portfolio(): st.empty()
-    
     main()
