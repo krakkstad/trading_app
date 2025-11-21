@@ -17,7 +17,7 @@ GLOBAL_STATE_LOCK = threading.Lock()
 
 class Student:
     """Enkel klasse for å holde Portefølje- og Kontantdata."""
-    # NØKKEL-FIKS: 'cash' er parameteren. Kalles nå eksplisitt med 'cash=' i main()
+    # RIKTIG SIGNATUR: Parameteret er 'cash'
     def __init__(self, student_id, role, cash=100000.0, portfolio=None, transactions=None):
         self.id = student_id
         self.role = role  
@@ -38,9 +38,8 @@ class Student:
             transactions=data['transactions']
         )
 
-# NYE FUNKSJONER FOR PERSISTENT LAGRING
+# FUNKSJONER FOR PERSISTENT LAGRING
 def load_global_students():
-    """Laster Student-objekter fra JSON-fil."""
     try:
         with open(STUDENTS_FILE, 'r') as f:
             data = json.load(f)
@@ -49,7 +48,6 @@ def load_global_students():
         return {} 
 
 def save_global_students(students_dict):
-    """Lagrer Student-objekter til JSON-fil."""
     try:
         data_to_save = {k: v.to_dict() for k, v in students_dict.items()}
         with open(STUDENTS_FILE, 'w') as f:
@@ -352,7 +350,7 @@ def display_portfolio():
 # ==============================================================================
 
 def main():
-    st.set_page_config(page_title="Opsjonsmarked Simulator V16.2 (Stabil Fiks)", layout="wide")
+    st.set_page_config(page_title="Opsjonsmarked Simulator V16.3 (Endelig Fiks)", layout="wide")
     
     initialize_state()
 
@@ -384,7 +382,7 @@ def main():
                         if student_id not in global_students:
                             initial_cash = 100000.0 if role_type == 'MAKER' else 50000.0
                             
-                            # ✅ LØSNING: Bruker 'cash=initial_cash' for å matche __init__ signaturen
+                            # ✅ LØSNING IMPLEMENTERT: Bruker 'cash=initial_cash' (IKKE initial_cash=initial_cash)
                             global_students[student_id] = Student(student_id, role_type, cash=initial_cash) 
                         
                             # KRITISK: Lagre den nye studenten til filen!
@@ -393,7 +391,6 @@ def main():
                     # Sett ID lokalt og i URL
                     st.query_params["user_id"] = student_id
                     st.session_state.active_student_id = student_id
-                    # Henter rolle fra den nylig opprettede/hentede studenten
                     st.session_state.user_role = global_students[student_id].role 
                     st.rerun() 
             return 
